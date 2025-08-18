@@ -21,6 +21,7 @@ use crypto::{Digest, PublicKey, SignatureService};
 use futures::sink::SinkExt as _;
 use log::info;
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
+use crate::metrics::{record_batch_arrival, record_tx_submit_ms, observe_tx_submit_to_commit_latency};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
@@ -67,9 +68,9 @@ pub enum PrimaryWorkerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
-    OurBatch(Digest, WorkerId),
+    OurBatch(Digest, WorkerId, /* first_tx_submit_ms */ u64, /* batch_size_bytes */ u64),
     /// The worker indicates it received a batch's digest from another authority.
-    OthersBatch(Digest, WorkerId),
+    OthersBatch(Digest, WorkerId, /* batch_size_bytes */ u64),
 }
 
 pub struct Primary;
@@ -332,16 +333,23 @@ impl MessageHandler for WorkerReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
+            WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, _batch_size_bytes) => {
+                record_batch_arrival(&digest);
+                if first_tx_submit_ms > 0 { record_tx_submit_ms(&digest, first_tx_submit_ms); }
+                self
                 .tx_our_digests                                         //sender channel to Proposer
                 .send((digest, worker_id))
                 .await
-                .expect("Failed to send workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
+                .expect("Failed to send workers' digests")
+            },
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id, _batch_size_bytes) => {
+                record_batch_arrival(&digest);
+                self
                 .tx_others_digests                                      //sender channel to PayloadReceiver
                 .send((digest, worker_id))
                 .await
-                .expect("Failed to send workers' digests"),
+                .expect("Failed to send workers' digests")
+            },
         }
         Ok(())
     }

@@ -15,6 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_LAST_COMMITTED_HEIGHT, PRIMARY_LAST_DECIDED_TIME_SECONDS, PRIMARY_LAST_DECIDED_VIEW, observe_propose_to_commit_latency, update_last_decided_view, observe_commit_digests_count, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, observe_commit_bytes};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -160,6 +161,21 @@ impl Committer {
                                     if let Err(e) = self.tx_output.send(header.clone()).await {
                                         debug!("Failed to send block through the output channel: {}", e);
                                     }
+                                    PRIMARY_COMMITS_TOTAL.inc();
+                                    PRIMARY_LAST_COMMITTED_HEIGHT.set(header.height as i64);
+                                    PRIMARY_LAST_DECIDED_TIME_SECONDS.set(chrono::Utc::now().timestamp() as f64);
+                                    observe_commit_digests_count(header.payload.len());
+                                    // update_last_decided_view(view as u64);
+                                    observe_propose_to_commit_latency(&header.id);
+                                    // Observe batch ingress->commit for all digests in this committed header
+                                    let mut total_bytes: u64 = 0;
+                                    for (digest, _) in header.payload.iter() {
+                                        observe_batch_ingress_to_commit_latency(digest);
+                                        observe_tx_submit_to_commit_latency(digest);
+                                        // We don't have per-batch byte sizes from peers here; if needed, will add later.
+                                    }
+                                    observe_commit_digests_count(header.payload.len());
+                                    observe_commit_bytes(total_bytes);
                                     debug!("Finish upcall");
                                 }
                             }

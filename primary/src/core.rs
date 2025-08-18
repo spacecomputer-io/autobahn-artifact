@@ -19,6 +19,7 @@ use crypto::{Hash as _, Signature};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use log::{debug, error, warn};
+use crate::metrics::{PRIMARY_TIMEOUTS_TOTAL, PRIMARY_TIMEOUTS_AS_LEADER_TOTAL};
 use network::{CancelHandler, ReliableSender};
 use core::panic;
 use std::borrow::BorrowMut;
@@ -1704,6 +1705,9 @@ impl Core {
 
     async fn local_timeout_round(&mut self, slot: Slot, view: View) -> DagResult<()> {
         warn!("Timeout reached for slot {}, view {}", slot, view);
+        PRIMARY_TIMEOUTS_TOTAL.inc();
+        let leader = self.leader_elector.get_leader(slot, view);
+        if leader == self.name { PRIMARY_TIMEOUTS_AS_LEADER_TOTAL.inc(); }
         //println!("timeout was triggered");
 
         //If timer was cancelled, ignore  -- Note: technically redundant with commit check below, but currently we do not insert CommitQC's... TODO: Need to insert these so we can avoid joining view change and just reply.

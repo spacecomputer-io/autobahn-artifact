@@ -18,6 +18,9 @@ use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
+use crate::metrics::{WORKER_BATCHES_SEALED_TOTAL, WORKER_BATCH_SIZE_BYTES};
+use std::time::{SystemTime, UNIX_EPOCH};
+use crate::processor::SerializedBatchMessage;
 
 #[cfg(test)]
 #[path = "tests/batch_maker_tests.rs"]
@@ -38,7 +41,7 @@ pub struct BatchMaker {
     rx_transaction: Receiver<Transaction>,
    
     //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
-    tx_batch: Sender<Vec<u8>>,   // channel to forward batch digest to processor in order for primary to propose.
+    tx_batch: Sender<SerializedBatchMessage>,   // channel to forward batch digest (and first tx time) to processor in order for primary to propose.
 
     /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
@@ -48,6 +51,8 @@ pub struct BatchMaker {
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: SimpleSender,
+    /// Timestamp in ms of the first tx received for the currently building batch (if any).
+    first_tx_submit_ms: Option<u64>,
 }
 
 impl BatchMaker {
@@ -56,7 +61,7 @@ impl BatchMaker {
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>, //receiver channel from worker.TxReceiverHandler 
         //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
-        tx_batch: Sender<Vec<u8>>,   // sender channel to worker.Processor
+        tx_batch: Sender<SerializedBatchMessage>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
         tokio::spawn(async move {
@@ -70,6 +75,7 @@ impl BatchMaker {
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: SimpleSender::new(),
+                first_tx_submit_ms: None,
             }
             .run()
             .await;
@@ -86,6 +92,10 @@ impl BatchMaker {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
+                    if self.current_batch.is_empty() && self.first_tx_submit_ms.is_none() {
+                        let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+                        self.first_tx_submit_ms = Some(ts_ms);
+                    }
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
@@ -117,8 +127,7 @@ impl BatchMaker {
 
     /// Seal and broadcast the current batch.
     async fn seal(&mut self) {
-        #[cfg(feature = "benchmark")]
-        let size = self.current_batch_size;
+        let sealed_size = self.current_batch_size;
 
         // Look for sample txs (they all start with 0) and gather their txs id (the next 8 bytes).
         #[cfg(feature = "benchmark")]
@@ -134,6 +143,7 @@ impl BatchMaker {
         let batch: Vec<_> = self.current_batch.drain(..).collect();
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
+        let batch_size_bytes = serialized.len() as u64;
 
         #[cfg(feature = "benchmark")]
         {
@@ -165,7 +175,10 @@ impl BatchMaker {
         let bytes = Bytes::from(serialized.clone());
         self.network.broadcast(addresses, bytes).await; 
 
-        self.tx_batch.send(serialized).await.expect("Failed to deliver batch");
+        let submit_ms = self.first_tx_submit_ms.take();
+        self.tx_batch.send((serialized, submit_ms)).await.expect("Failed to deliver batch");
+        WORKER_BATCHES_SEALED_TOTAL.inc();
+        WORKER_BATCH_SIZE_BYTES.set(sealed_size as i64);
 
         //OLD:
         //This uses reliable sender. The receiver worker will reply with an ack. The Reply Handler is passed to Quorum Waiter.

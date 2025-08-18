@@ -6,6 +6,7 @@ mod processor;
 mod quorum_waiter;
 mod synchronizer;
 mod worker;
+pub mod metrics;
 
 #[cfg(test)]
 #[path = "tests/common.rs"]

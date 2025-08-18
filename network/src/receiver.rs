@@ -5,6 +5,8 @@ use bytes::Bytes;
 use futures::stream::SplitSink;
 use futures::stream::StreamExt as _;
 use log::{debug, info, warn};
+use lazy_static::lazy_static;
+use prometheus::{register_int_counter, register_int_gauge, IntCounter, IntGauge};
 use std::error::Error;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
@@ -51,6 +53,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
             .expect("Failed to bind TCP port");
 
         debug!("Listening on {}", self.address);
+        NET_LISTENERS_BOUND_TOTAL.inc();
         loop {
             let (socket, peer) = match listener.accept().await {
                 Ok(value) => value,
@@ -60,6 +63,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 }
             };
             info!("Incoming connection established with {}", peer);
+            NET_CONNECTED_PEERS_GAUGE.inc();
             Self::spawn_runner(socket, peer, self.handler.clone()).await;
         }
     }
@@ -73,18 +77,41 @@ impl<Handler: MessageHandler> Receiver<Handler> {
             while let Some(frame) = reader.next().await {
                 match frame.map_err(|e| NetworkError::FailedToReceiveMessage(peer, e)) {
                     Ok(message) => {
+                        NET_RECV_MESSAGES_TOTAL.inc();
                         if let Err(e) = handler.dispatch(&mut writer, message.freeze()).await {
                             warn!("{}", e);
+                            NET_FAILED_RECV_MESSAGES_TOTAL.inc();
                             return;
                         }
                     }
                     Err(e) => {
                         warn!("{}", e);
+                        NET_FAILED_RECV_MESSAGES_TOTAL.inc();
                         return;
                     }
                 }
             }
             warn!("Connection closed by peer {}", peer);
+            NET_CONNECTED_PEERS_GAUGE.dec();
         });
     }
+}
+
+lazy_static! {
+    static ref NET_RECV_MESSAGES_TOTAL: IntCounter = register_int_counter!(
+        "network_recv_messages_total",
+        "Total number of received network messages"
+    ).expect("failed to register network_recv_messages_total");
+    static ref NET_FAILED_RECV_MESSAGES_TOTAL: IntCounter = register_int_counter!(
+        "network_failed_recv_messages_total",
+        "Total number of failed network message receives"
+    ).expect("failed to register network_failed_recv_messages_total");
+    static ref NET_LISTENERS_BOUND_TOTAL: IntCounter = register_int_counter!(
+        "network_listeners_bound_total",
+        "Total number of receivers bound"
+    ).expect("failed to register network_listeners_bound_total");
+    static ref NET_CONNECTED_PEERS_GAUGE: IntGauge = register_int_gauge!(
+        "network_connected_peers",
+        "Gauge for currently connected peers (best-effort)"
+    ).expect("failed to register network_connected_peers");
 }

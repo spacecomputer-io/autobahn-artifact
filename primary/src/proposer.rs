@@ -11,6 +11,7 @@ use log::debug;
 use log::info;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
+use crate::metrics::{PRIMARY_HEADERS_PROPOSED_TOTAL, PRIMARY_CURRENT_HEIGHT, record_propose_time, observe_header_num_digests};
 
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
@@ -164,10 +165,20 @@ impl Proposer {
         self.num_active_instances = 0;
       
         // Send the new header to the `Core` that will broadcast and process it.
+        observe_header_num_digests(header.payload.len());
+        record_propose_time(&header.id);
+
         self.tx_core
             .send(header)
             .await
             .expect("Failed to send header");
+
+        PRIMARY_HEADERS_PROPOSED_TOTAL.inc();
+        PRIMARY_CURRENT_HEIGHT.set(self.height as i64);
+        // Record start time for propose->commit latency using header id.
+        // Safety: header id is deterministic and unique within this process.
+        // We already moved header into channel, so use last known id via last_parent for tracking if available.
+        // Here, we simply record by the last proposed header id via the channel send above by cloning before.
     }
 
     // Main loop listening to incoming messages.

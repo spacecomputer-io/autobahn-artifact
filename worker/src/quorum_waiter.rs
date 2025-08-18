@@ -38,7 +38,7 @@ impl QuorumWaiter {
         committee: Committee,
         stake: Stake,
         rx_message: Receiver<QuorumWaiterMessage>,
-        tx_batch: Sender<Vec<u8>>,
+        tx_batch: Sender<SerializedBatchMessage>,
     ) {
         tokio::spawn(async move {
             Self {

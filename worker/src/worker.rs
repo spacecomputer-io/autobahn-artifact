@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
+use crate::metrics::WORKER_TRANSACTIONS_RECEIVED_TOTAL;
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -263,6 +264,7 @@ impl MessageHandler for TxReceiverHandler {
             .send(message.to_vec())
             .await
             .expect("Failed to send transaction");
+        WORKER_TRANSACTIONS_RECEIVED_TOTAL.inc();
 
         // Give the change to schedule other tasks.
         tokio::task::yield_now().await;
@@ -291,7 +293,7 @@ impl MessageHandler for WorkerReceiverHandler {
         match bincode::deserialize(&serialized) {
             Ok(WorkerMessage::Batch(..)) => self     //If receive batch message from another worker. Store the batch, and process.
                 .tx_processor
-                .send(serialized.to_vec())
+                .send((serialized.to_vec(), None))
                 .await
                 .expect("Failed to send batch"),
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self  //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.

@@ -8,13 +8,14 @@ use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+use crate::metrics::WORKER_DIGESTS_SENT_TO_PRIMARY_TOTAL;
 
 #[cfg(test)]
 #[path = "tests/processor_tests.rs"]
 pub mod processor_tests;
 
 /// Indicates a serialized `WorkerMessage::Batch` message.
-pub type SerializedBatchMessage = Vec<u8>;
+pub type SerializedBatchMessage = (Vec<u8>, Option<u64>);
 
 /// Hashes and stores batches, it then outputs the batch's digest.
 pub struct Processor;
@@ -33,7 +34,7 @@ impl Processor {
         own_digest: bool,
     ) {
         tokio::spawn(async move {
-            while let Some(batch) = rx_batch.recv().await {
+            while let Some((batch, first_tx_at_ms)) = rx_batch.recv().await {
                 // Hash the batch.
                 let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
 
@@ -43,8 +44,8 @@ impl Processor {
 
                 // Deliver the batch's digest.
                 let message = match own_digest {
-                    true => WorkerPrimaryMessage::OurBatch(digest, id),
-                    false => WorkerPrimaryMessage::OthersBatch(digest, id),
+                    true => WorkerPrimaryMessage::OurBatch(digest, id, first_tx_at_ms.unwrap_or(0), 0),
+                    false => WorkerPrimaryMessage::OthersBatch(digest, id, 0),
                 };
                 let message = bincode::serialize(&message)
                     .expect("Failed to serialize our own worker-primary message");
@@ -52,6 +53,7 @@ impl Processor {
                     .send(message)
                     .await
                     .expect("Failed to send digest");
+                WORKER_DIGESTS_SENT_TO_PRIMARY_TOTAL.inc();
             }
         });
     }

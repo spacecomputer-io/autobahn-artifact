@@ -14,6 +14,13 @@ use primary::Primary;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use worker::Worker;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use prometheus::{default_registry, Encoder, TextEncoder, Registry};
+use std::sync::Arc;
 
 /// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -38,6 +45,9 @@ async fn main() -> Result<()> {
                 .args_from_usage("--committee=<FILE> 'The file containing committee information'")
                 .args_from_usage("--parameters=[FILE] 'The file containing the node parameters'")
                 .args_from_usage("--store=<PATH> 'The path where to create the data store'")
+                .args_from_usage("--metrics-address=[ADDR] 'HTTP address to expose Prometheus metrics, e.g. 0.0.0.0:9100'")
+                .args_from_usage("--metrics-file=[FILE] 'If set, periodically flush /metrics output to this file'" )
+                .args_from_usage("--metrics-flush-interval-ms=[INT] 'Flush period to write metrics to file (default 5000 ms)'")
                 .subcommand(SubCommand::with_name("primary").about("Run a single primary"))
                 .subcommand(
                     SubCommand::with_name("worker")
@@ -77,6 +87,22 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let committee_file = matches.value_of("committee").unwrap();
     let parameters_file = matches.value_of("parameters");
     let store_path = matches.value_of("store").unwrap();
+
+    // Metrics: setup exporter and optional file flusher
+    let metrics_addr: Option<SocketAddr> = matches
+        .value_of("metrics-address")
+        .and_then(|s| s.parse().ok());
+    let metrics_file: Option<String> = matches.value_of("metrics-file").map(|s| s.to_string());
+    let flush_interval_ms: u64 = matches
+        .value_of("metrics-flush-interval-ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
+
+    // Use the global default Prometheus registry for the process so other crates can register easily.
+    let registry: &Registry = default_registry();
+    let registry = Arc::new(registry.clone());
+    start_metrics_http_exporter(metrics_addr, registry.clone()).await?;
+    start_metrics_file_flusher(metrics_file, flush_interval_ms, registry.clone()).await?;
 
     // Read the committee and node's keypair from file.
     let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
@@ -179,4 +205,69 @@ async fn analyze(mut rx_output: Receiver<Header>) {
     while let Some(_header) = rx_output.recv().await {
         // NOTE: Here goes the application logic.
     }
+}
+
+async fn start_metrics_http_exporter(
+    addr: Option<SocketAddr>,
+    registry: Arc<Registry>,
+) -> Result<()> {
+    if addr.is_none() {
+        return Ok(());
+    }
+    let bind_addr = addr.unwrap();
+
+    let make_svc = make_service_fn(move |_| {
+        let registry = registry.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let registry = registry.clone();
+                async move {
+                    match (req.method(), req.uri().path()) {
+                        (&Method::GET, "/metrics") => {
+                            let encoder = TextEncoder::new();
+                            let metric_families = registry.gather();
+                            let mut buffer = Vec::new();
+                            encoder.encode(&metric_families, &mut buffer).unwrap();
+                            Ok::<_, hyper::Error>(Response::new(Body::from(buffer)))
+                        }
+                        _ => {
+                            let mut not_found = Response::default();
+                            *not_found.status_mut() = StatusCode::NOT_FOUND;
+                            Ok::<_, hyper::Error>(not_found)
+                        }
+                    }
+                }
+            }))
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = Server::bind(&bind_addr).serve(make_svc).await {
+            log::error!("metrics HTTP server error: {}", e);
+        }
+    });
+    Ok(())
+}
+
+async fn start_metrics_file_flusher(
+    metrics_file: Option<String>,
+    flush_interval_ms: u64,
+    registry: Arc<Registry>,
+) -> Result<()> {
+    if metrics_file.is_none() {
+        return Ok(());
+    }
+    let path = metrics_file.unwrap();
+    tokio::spawn(async move {
+        let encoder = TextEncoder::new();
+        loop {
+            let metric_families = registry.gather();
+            let mut buffer = Vec::new();
+            if encoder.encode(&metric_families, &mut buffer).is_ok() {
+                let _ = tokio::fs::write(&path, buffer).await; // best-effort
+            }
+            tokio::time::sleep(Duration::from_millis(flush_interval_ms)).await;
+        }
+    });
+    Ok(())
 }
