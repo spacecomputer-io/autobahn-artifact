@@ -21,7 +21,7 @@ use crypto::{Digest, PublicKey, SignatureService};
 use futures::sink::SinkExt as _;
 use log::info;
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
-use crate::metrics::{record_batch_arrival, record_tx_submit_ms, observe_tx_submit_to_commit_latency};
+use crate::metrics::{record_batch_arrival, record_tx_submit_ms, observe_tx_submit_to_commit_latency, record_batch_size_bytes};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
@@ -333,8 +333,9 @@ impl MessageHandler for WorkerReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, _batch_size_bytes) => {
+            WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes) => {
                 record_batch_arrival(&digest);
+                record_batch_size_bytes(&digest, batch_size_bytes);
                 if first_tx_submit_ms > 0 { record_tx_submit_ms(&digest, first_tx_submit_ms); }
                 self
                 .tx_our_digests                                         //sender channel to Proposer
@@ -342,8 +343,9 @@ impl MessageHandler for WorkerReceiverHandler {
                 .await
                 .expect("Failed to send workers' digests")
             },
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id, _batch_size_bytes) => {
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes) => {
                 record_batch_arrival(&digest);
+                record_batch_size_bytes(&digest, batch_size_bytes);
                 self
                 .tx_others_digests                                      //sender channel to PayloadReceiver
                 .send((digest, worker_id))

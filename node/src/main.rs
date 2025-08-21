@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
                 .args_from_usage("--parameters=[FILE] 'The file containing the node parameters'")
                 .args_from_usage("--store=<PATH> 'The path where to create the data store'")
                 .args_from_usage("--metrics-address=[ADDR] 'HTTP address to expose Prometheus metrics, e.g. 0.0.0.0:9100'")
-                .args_from_usage("--metrics-file=[FILE] 'If set, periodically flush /metrics output to this file'" )
+                .args_from_usage("--metrics-file=[FILE] 'If set, periodically flush /metrics to timestamped files using this as base name'" )
                 .args_from_usage("--metrics-flush-interval-ms=[INT] 'Flush period to write metrics to file (default 5000 ms)'")
                 .subcommand(SubCommand::with_name("primary").about("Run a single primary"))
                 .subcommand(
@@ -257,14 +257,24 @@ async fn start_metrics_file_flusher(
     if metrics_file.is_none() {
         return Ok(());
     }
-    let path = metrics_file.unwrap();
+    let base_path = metrics_file.unwrap();
     tokio::spawn(async move {
         let encoder = TextEncoder::new();
         loop {
             let metric_families = registry.gather();
             let mut buffer = Vec::new();
             if encoder.encode(&metric_families, &mut buffer).is_ok() {
-                let _ = tokio::fs::write(&path, buffer).await; // best-effort
+                // Build timestamped filename: <stem>-<unix_ms>.<ext> in the same directory
+                use std::path::{Path, PathBuf};
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let base: &Path = Path::new(&base_path);
+                let dir: &Path = base.parent().unwrap_or(Path::new("."));
+                let stem: &str = base.file_stem().and_then(|s| s.to_str()).unwrap_or("metrics");
+                let ext: &str = base.extension().and_then(|e| e.to_str()).unwrap_or("prom");
+                let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                let filename = format!("{}-{}.{}", stem, ts_ms, ext);
+                let path_out: PathBuf = dir.join(filename);
+                let _ = tokio::fs::write(path_out, buffer).await; // best-effort
             }
             tokio::time::sleep(Duration::from_millis(flush_interval_ms)).await;
         }

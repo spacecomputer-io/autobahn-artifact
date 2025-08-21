@@ -72,19 +72,22 @@ lazy_static! {
     pub static ref PRIMARY_PROPOSE_TO_COMMIT_LATENCY_MS: Histogram =
         register_histogram!(
             "primary_propose_to_commit_latency_ms",
-            "Latency from header proposal to commit in milliseconds"
+            "Latency from header proposal to commit in milliseconds",
+            vec![1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0]
         )
         .expect("failed to register primary_propose_to_commit_latency_ms");
     pub static ref PRIMARY_BATCH_INGRESS_TO_COMMIT_LATENCY_MS: Histogram =
         register_histogram!(
             "primary_batch_ingress_to_commit_latency_ms",
-            "Latency from batch digest arrival at primary to commit in milliseconds"
+            "Latency from batch digest arrival at primary to commit in milliseconds",
+            vec![1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0]
         )
         .expect("failed to register primary_batch_ingress_to_commit_latency_ms");
     pub static ref PRIMARY_TX_SUBMIT_TO_COMMIT_LATENCY_MS: Histogram =
         register_histogram!(
             "primary_tx_submit_to_commit_latency_ms",
-            "Latency from first tx submission in a batch (reported by worker) to commit in milliseconds"
+            "Latency from first tx submission in a batch (reported by worker) to commit in milliseconds",
+            vec![1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0]
         )
         .expect("failed to register primary_tx_submit_to_commit_latency_ms");
 
@@ -98,6 +101,7 @@ lazy_static! {
     static ref PROPOSE_TIMES: Mutex<HashMap<Digest, Instant>> = Mutex::new(HashMap::new());
     static ref BATCH_ARRIVAL_TIMES: Mutex<HashMap<Digest, Instant>> = Mutex::new(HashMap::new());
     static ref SUBMIT_MS_BY_BATCH: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
+    static ref BATCH_SIZE_BYTES_BY_DIGEST: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
     static ref LAST_DECIDED_VIEW_TRACKER: Mutex<Option<u64>> = Mutex::new(None);
     pub static ref PRIMARY_LATEST_HEADER_NUM_DIGESTS: IntGauge = register_int_gauge!(
         "primary_latest_header_num_digests",
@@ -172,6 +176,16 @@ pub fn observe_commit_bytes(bytes: u64) {
     let secs = if w.is_empty() { 1.0 } else { WINDOW_SECS };
     PRIMARY_COMMITTED_BYTES_PER_SEC.set(total as f64 / secs);
     PRIMARY_LAST_COMMITTED_BYTES.set(bytes as i64);
+}
+
+pub fn record_batch_size_bytes(digest: &Digest, bytes: u64) {
+    let mut map = BATCH_SIZE_BYTES_BY_DIGEST.lock().unwrap();
+    map.insert(digest.clone(), bytes);
+}
+
+pub fn take_batch_size_bytes(digest: &Digest) -> u64 {
+    let mut map = BATCH_SIZE_BYTES_BY_DIGEST.lock().unwrap();
+    map.remove(digest).unwrap_or(0)
 }
 
 pub fn record_batch_arrival(digest: &Digest) {

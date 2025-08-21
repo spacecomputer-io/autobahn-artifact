@@ -1704,7 +1704,8 @@ impl Core {
 
 
     async fn local_timeout_round(&mut self, slot: Slot, view: View) -> DagResult<()> {
-        warn!("Timeout reached for slot {}, view {}", slot, view);
+        // Using warn! only for actionable timeouts; otherwise we mark as OBSOLETE and keep at debug level.
+        warn!("Timeout fired for slot {}, view {} (pending evaluation)", slot, view);
         PRIMARY_TIMEOUTS_TOTAL.inc();
         let leader = self.leader_elector.get_leader(slot, view);
         if leader == self.name { PRIMARY_TIMEOUTS_AS_LEADER_TOTAL.inc(); }
@@ -1712,7 +1713,7 @@ impl Core {
 
         //If timer was cancelled, ignore  -- Note: technically redundant with commit check below, but currently we do not insert CommitQC's... TODO: Need to insert these so we can avoid joining view change and just reply.
         if !self.timers.contains(&(slot, view)) {
-            debug!("Timer for slot {}, view {} is obsolete. Has been cancelled", slot, view);
+            debug!("[TIMEOUT-OBSOLETE] Timer for slot {}, view {} canceled/absent", slot, view);
             return Ok(())
         }
 
@@ -1720,7 +1721,7 @@ impl Core {
         match self.views.get(&slot) {
             Some(v) => {
                 if *v > view {
-                    debug!("Timer for slot {}, view {} is obsolete. Have moved to view {}", slot, view, *v);
+                    debug!("[TIMEOUT-OBSOLETE] Timer for slot {}, view {} < current view {}", slot, view, *v);
                     return Ok(());
                 }
             },
@@ -1741,7 +1742,7 @@ impl Core {
             None => {},
         };
 
-        debug!("Sending Timeout for slot {}, view {}", slot, view);
+        debug!("[TIMEOUT-ACTION] Sending Timeout for slot {}, view {}", slot, view);
         // Make a timeout message.for the slot, view, containing the highest QC this replica has
         // seen
         let timeout = Timeout::new(
@@ -1753,10 +1754,10 @@ impl Core {
             self.signature_service.clone(),
         )
         .await;
-        debug!("Created Timeout: {:?}", timeout);
+        debug!("[TIMEOUT-ACTION] Created Timeout: {:?}", timeout);
 
         // Broadcast the timeout message.
-        debug!("Broadcasting Timeout: {:?}", timeout);
+        debug!("[TIMEOUT-ACTION] Broadcasting Timeout: {:?}", timeout);
         let addresses = self
             .committee
             .others_primaries(&self.name)
