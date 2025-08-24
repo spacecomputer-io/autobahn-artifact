@@ -37,6 +37,7 @@ impl Processor {
             while let Some((batch, first_tx_at_ms)) = rx_batch.recv().await {
                 // Hash the batch.
                 let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
+                let batch_size_bytes = batch.len() as u64;
 
                 // Store the batch.
                 store.write(digest.to_vec(), batch).await;
@@ -44,8 +45,8 @@ impl Processor {
 
                 // Deliver the batch's digest.
                 let message = match own_digest {
-                    true => WorkerPrimaryMessage::OurBatch(digest, id, first_tx_at_ms.unwrap_or(0), 0),
-                    false => WorkerPrimaryMessage::OthersBatch(digest, id, 0),
+                    true => WorkerPrimaryMessage::OurBatch(digest, id, first_tx_at_ms.unwrap_or(0), batch_size_bytes),
+                    false => WorkerPrimaryMessage::OthersBatch(digest, id, batch_size_bytes),
                 };
                 let message = bincode::serialize(&message)
                     .expect("Failed to serialize our own worker-primary message");

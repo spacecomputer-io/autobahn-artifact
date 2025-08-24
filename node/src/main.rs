@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
-use prometheus::{default_registry, Encoder, TextEncoder, Registry};
+use prometheus::{default_registry, Encoder, TextEncoder, Registry, register_gauge, Gauge};
 use std::sync::Arc;
 
 /// The default channel capacity.
@@ -258,6 +258,11 @@ async fn start_metrics_file_flusher(
         return Ok(());
     }
     let base_path = metrics_file.unwrap();
+    // Register a gauge once that we will update on every flush with the current timestamp (ms).
+    let flush_ts_gauge: Gauge = register_gauge!(
+        "node_metrics_flush_timestamp_ms",
+        "Timestamp (ms since epoch) of this process' last metrics flush"
+    ).expect("failed to register node_metrics_flush_timestamp_ms");
     tokio::spawn(async move {
         let encoder = TextEncoder::new();
         loop {
@@ -272,6 +277,8 @@ async fn start_metrics_file_flusher(
                 let stem: &str = base.file_stem().and_then(|s| s.to_str()).unwrap_or("metrics");
                 let ext: &str = base.extension().and_then(|e| e.to_str()).unwrap_or("prom");
                 let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                // Update the flush timestamp gauge
+                flush_ts_gauge.set(ts_ms as f64);
                 let filename = format!("{}-{}.{}", stem, ts_ms, ext);
                 let path_out: PathBuf = dir.join(filename);
                 let _ = tokio::fs::write(path_out, buffer).await; // best-effort
