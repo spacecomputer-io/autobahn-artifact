@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use prometheus::{register_gauge, register_histogram, register_int_counter, register_int_gauge, Gauge, Histogram, IntCounter, IntGauge};
+use prometheus::{register_gauge, register_histogram, register_int_counter, register_int_gauge, register_histogram_vec, Gauge, Histogram, HistogramVec, IntCounter, IntGauge};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -69,27 +69,15 @@ lazy_static! {
         )
         .expect("failed to register primary_timeouts_as_leader_total");
 
-    pub static ref PRIMARY_PROPOSE_TO_COMMIT_LATENCY_MS: Histogram =
-        register_histogram!(
-            "primary_propose_to_commit_latency_ms",
-            "Latency from header proposal to commit in milliseconds",
-            vec![1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0]
+    pub static ref PRIMARY_LATENCY_SECONDS: HistogramVec =
+        register_histogram_vec!(
+            "primary_latency_seconds",
+            "Primary latencies by phase (seconds)",
+            &["phase"],
+            // quasi-log buckets from 1ms to 60s
+            vec![0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0]
         )
-        .expect("failed to register primary_propose_to_commit_latency_ms");
-    pub static ref PRIMARY_BATCH_INGRESS_TO_COMMIT_LATENCY_MS: Histogram =
-        register_histogram!(
-            "primary_batch_ingress_to_commit_latency_ms",
-            "Latency from batch digest arrival at primary to commit in milliseconds",
-            vec![1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0]
-        )
-        .expect("failed to register primary_batch_ingress_to_commit_latency_ms");
-    pub static ref PRIMARY_TX_SUBMIT_TO_COMMIT_LATENCY_MS: Histogram =
-        register_histogram!(
-            "primary_tx_submit_to_commit_latency_ms",
-            "Latency from first tx submission in a batch (reported by worker) to commit in milliseconds",
-            vec![1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0]
-        )
-        .expect("failed to register primary_tx_submit_to_commit_latency_ms");
+        .expect("failed to register primary_latency_seconds");
 
     pub static ref PRIMARY_NUM_DIGESTS_PER_HEADER: Histogram =
         register_histogram!(
@@ -131,8 +119,8 @@ pub fn record_propose_time(header_id: &Digest) {
 pub fn observe_propose_to_commit_latency(header_id: &Digest) {
     let mut map = PROPOSE_TIMES.lock().unwrap();
     if let Some(start) = map.remove(header_id) {
-        let ms = start.elapsed().as_millis() as f64;
-        PRIMARY_PROPOSE_TO_COMMIT_LATENCY_MS.observe(ms);
+        let secs = start.elapsed().as_secs_f64();
+        PRIMARY_LATENCY_SECONDS.with_label_values(&["propose_to_commit"]).observe(secs);
     }
 }
 
@@ -196,8 +184,8 @@ pub fn record_batch_arrival(digest: &Digest) {
 pub fn observe_batch_ingress_to_commit_latency(digest: &Digest) {
     let mut map = BATCH_ARRIVAL_TIMES.lock().unwrap();
     if let Some(start) = map.remove(digest) {
-        let ms = start.elapsed().as_millis() as f64;
-        PRIMARY_BATCH_INGRESS_TO_COMMIT_LATENCY_MS.observe(ms);
+        let secs = start.elapsed().as_secs_f64();
+        PRIMARY_LATENCY_SECONDS.with_label_values(&["batch_ingress_to_commit"]).observe(secs);
     }
 }
 
@@ -211,8 +199,8 @@ pub fn observe_tx_submit_to_commit_latency(digest: &Digest) {
     if let Some(start_ms) = map.remove(digest) {
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         if now_ms >= start_ms {
-            let delta = now_ms - start_ms;
-            PRIMARY_TX_SUBMIT_TO_COMMIT_LATENCY_MS.observe(delta as f64);
+            let delta_secs = (now_ms - start_ms) as f64 / 1000.0;
+            PRIMARY_LATENCY_SECONDS.with_label_values(&["tx_submit_to_commit"]).observe(delta_secs);
         }
     }
 }

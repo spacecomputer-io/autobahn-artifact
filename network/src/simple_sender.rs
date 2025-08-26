@@ -5,7 +5,7 @@ use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use log::{info, warn};
 use lazy_static::lazy_static;
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{register_int_counter_vec, IntCounterVec};
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
@@ -52,7 +52,7 @@ impl SimpleSender {
     /// Try (best-effort) to send a message to a specific address.
     /// This is useful to answer sync requests.
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
-        NET_SEND_MESSAGES_TOTAL.inc();
+        NETWORK_MESSAGES_TOTAL.with_label_values(&["send"]).inc();
         // Try to re-use an existing connection if possible.
         if let Some(tx) = self.connections.get(&address) {
             if tx.send(data.clone()).await.is_ok() {
@@ -125,7 +125,8 @@ impl Connection {
                 Some(data) = self.receiver.recv() => {
                     if let Err(e) = writer.send(data).await {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
-                        NET_FAILED_SEND_MESSAGES_TOTAL.inc();
+                        // Count failed send on send side
+                        NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_send"]).inc();
                         return;
                     }
                 },
@@ -137,7 +138,7 @@ impl Connection {
                         _ => {
                             // Something has gone wrong (either the channel dropped or we failed to read from it).
                             warn!("{}", NetworkError::FailedToReceiveAck(self.address));
-                            NET_FAILED_SEND_MESSAGES_TOTAL.inc();
+                            NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_send"]).inc();
                             return;
                         }
                     }
@@ -148,12 +149,9 @@ impl Connection {
 }
 
 lazy_static! {
-    static ref NET_SEND_MESSAGES_TOTAL: IntCounter = register_int_counter!(
-        "network_best_effort_send_messages_total",
-        "Total number of best-effort sent network messages"
-    ).expect("failed to register network_best_effort_send_messages_total");
-    static ref NET_FAILED_SEND_MESSAGES_TOTAL: IntCounter = register_int_counter!(
-        "network_best_effort_failed_send_messages_total",
-        "Total number of failed best-effort network sends or acks"
-    ).expect("failed to register network_best_effort_failed_send_messages_total");
+    static ref NETWORK_MESSAGES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "network_messages_total",
+        "Total number of network messages by direction",
+        &["direction"]
+    ).expect("failed to register network_messages_total");
 }
