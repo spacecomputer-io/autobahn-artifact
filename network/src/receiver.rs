@@ -6,7 +6,7 @@ use futures::stream::SplitSink;
 use futures::stream::StreamExt as _;
 use log::{debug, info, warn};
 use lazy_static::lazy_static;
-se crate::metrics::{NETWORK_CONNECTED_PEERS, NETWORK_MESSAGES_TOTAL};
+use crate::metrics::{NETWORK_CONNECTED_PEERS, NETWORK_MESSAGES_TOTAL};
 use prometheus::{register_int_counter, IntCounter};
 use std::error::Error;
 use std::net::SocketAddr;
