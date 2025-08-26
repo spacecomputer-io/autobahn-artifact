@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 mod error;
+pub mod metrics;
 mod receiver;
 mod reliable_sender;
 mod simple_sender;

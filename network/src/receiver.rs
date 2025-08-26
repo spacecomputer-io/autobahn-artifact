@@ -6,7 +6,8 @@ use futures::stream::SplitSink;
 use futures::stream::StreamExt as _;
 use log::{debug, info, warn};
 use lazy_static::lazy_static;
-use prometheus::{register_int_counter, register_int_counter_vec, register_int_gauge, IntCounter, IntCounterVec, IntGauge};
+se crate::metrics::{NETWORK_CONNECTED_PEERS, NETWORK_MESSAGES_TOTAL};
+use prometheus::{register_int_counter, IntCounter};
 use std::error::Error;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
@@ -63,7 +64,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 }
             };
             info!("Incoming connection established with {}", peer);
-            NET_CONNECTED_PEERS_GAUGE.inc();
+            NETWORK_CONNECTED_PEERS.inc();
             Self::spawn_runner(socket, peer, self.handler.clone()).await;
         }
     }
@@ -80,40 +81,26 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                         NETWORK_MESSAGES_TOTAL.with_label_values(&["recv"]).inc();
                         if let Err(e) = handler.dispatch(&mut writer, message.freeze()).await {
                             warn!("{}", e);
-                            NETWORK_FAILED_MESSAGES_TOTAL.with_label_values(&["recv"]).inc();
+                            NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_recv"]).inc();
                             return;
                         }
                     }
                     Err(e) => {
                         warn!("{}", e);
-                        NETWORK_FAILED_MESSAGES_TOTAL.with_label_values(&["recv"]).inc();
+                        NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_recv"]).inc();
                         return;
                     }
                 }
             }
             warn!("Connection closed by peer {}", peer);
-            NET_CONNECTED_PEERS_GAUGE.dec();
+            NETWORK_CONNECTED_PEERS.dec();
         });
     }
 }
 
 lazy_static! {
-    static ref NETWORK_MESSAGES_TOTAL: IntCounterVec = register_int_counter_vec!(
-        "network_messages_total",
-        "Total number of network messages by direction",
-        &["direction"]
-    ).expect("failed to register network_messages_total");
-    static ref NETWORK_FAILED_MESSAGES_TOTAL: IntCounterVec = register_int_counter_vec!(
-        "network_failed_messages_total",
-        "Total number of failed network messages by direction",
-        &["direction"]
-    ).expect("failed to register network_failed_messages_total");
     static ref NET_LISTENERS_BOUND_TOTAL: IntCounter = register_int_counter!(
         "network_listeners_bound_total",
         "Total number of receivers bound"
     ).expect("failed to register network_listeners_bound_total");
-    static ref NET_CONNECTED_PEERS_GAUGE: IntGauge = register_int_gauge!(
-        "network_connected_peers",
-        "Gauge for currently connected peers (best-effort)"
-    ).expect("failed to register network_connected_peers");
 }

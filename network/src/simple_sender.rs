@@ -4,8 +4,7 @@ use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use log::{info, warn};
-use lazy_static::lazy_static;
-use prometheus::{register_int_counter_vec, IntCounterVec};
+use crate::metrics::NETWORK_MESSAGES_TOTAL;
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
@@ -148,10 +147,4 @@ impl Connection {
     }
 }
 
-lazy_static! {
-    static ref NETWORK_MESSAGES_TOTAL: IntCounterVec = register_int_counter_vec!(
-        "network_messages_total",
-        "Total number of network messages by direction",
-        &["direction"]
-    ).expect("failed to register network_messages_total");
-}
+// shared counters are in network::metrics
