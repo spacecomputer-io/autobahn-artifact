@@ -15,7 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_LAST_COMMITTED_HEIGHT, PRIMARY_LAST_DECIDED_TIME_SECONDS, PRIMARY_LAST_DECIDED_VIEW, observe_propose_to_commit_latency, update_last_decided_view, observe_commit_digests_count, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, observe_commit_bytes, take_batch_size_bytes};
+use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_LAST_COMMITTED_HEIGHT, PRIMARY_LAST_DECIDED_TIME_SECONDS, PRIMARY_LAST_DECIDED_VIEW, observe_propose_to_commit_latency, update_last_decided_view, observe_commit_digests_count, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, observe_commit_bytes, take_batch_size_bytes, record_flush_interval_commit};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -176,6 +176,10 @@ impl Committer {
                                     }
                                     observe_commit_digests_count(header.payload.len());
                                     observe_commit_bytes(total_bytes);
+                                    
+                                    // Record data for flush interval metrics
+                                    record_flush_interval_commit(header.payload.len(), total_bytes);
+                                    
                                     debug!("Finish upcall");
                                 }
                             }

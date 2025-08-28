@@ -11,6 +11,7 @@ use crypto::SignatureService;
 use env_logger::Env;
 use primary::Header;
 use primary::Primary;
+use primary::metrics::flush_interval_metrics;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use worker::Worker;
@@ -266,6 +267,9 @@ async fn start_metrics_file_flusher(
     tokio::spawn(async move {
         let encoder = TextEncoder::new();
         loop {
+            // Calculate averages and reset flush interval metrics before gathering
+            flush_interval_metrics();
+            
             let metric_families = registry.gather();
             let mut buffer = Vec::new();
             if encoder.encode(&metric_families, &mut buffer).is_ok() {
