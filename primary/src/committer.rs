@@ -15,7 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_LAST_COMMITTED_HEIGHT, PRIMARY_LAST_DECIDED_TIME_SECONDS, PRIMARY_LAST_DECIDED_VIEW, observe_propose_to_commit_latency, update_last_decided_view, observe_commit_digests_count, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, observe_commit_bytes, take_batch_size_bytes, record_flush_interval_commit};
+use crate::metrics::{PRIMARY_COMMITS_TOTAL, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, record_flush_interval_commit};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -162,10 +162,6 @@ impl Committer {
                                         debug!("Failed to send block through the output channel: {}", e);
                                     }
                                     PRIMARY_COMMITS_TOTAL.inc();
-                                    PRIMARY_LAST_COMMITTED_HEIGHT.set(header.height as i64);
-                                    PRIMARY_LAST_DECIDED_TIME_SECONDS.set(chrono::Utc::now().timestamp() as f64);
-                                    observe_commit_digests_count(header.payload.len());
-                                    // update_last_decided_view(view as u64);
                                     observe_propose_to_commit_latency(&header.id);
                                     // Observe batch ingress->commit for all digests in this committed header
                                     let mut total_bytes: u64 = 0;
@@ -174,8 +170,6 @@ impl Committer {
                                         observe_tx_submit_to_commit_latency(digest);
                                         total_bytes = total_bytes.saturating_add(take_batch_size_bytes(digest));
                                     }
-                                    observe_commit_digests_count(header.payload.len());
-                                    observe_commit_bytes(total_bytes);
                                     
                                     // Record data for flush interval metrics
                                     record_flush_interval_commit(header.payload.len(), total_bytes);

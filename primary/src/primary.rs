@@ -19,7 +19,7 @@ use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use futures::sink::SinkExt as _;
-use log::info;
+use log::{info, debug, warn, error};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use crate::metrics::{record_batch_arrival, record_tx_submit_ms, observe_tx_submit_to_commit_latency, record_batch_size_bytes};
 use serde::{Deserialize, Serialize};
@@ -331,27 +331,45 @@ impl MessageHandler for WorkerReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
+        info!("🔍 WorkerReceiverHandler: Received {} bytes from worker", serialized.len());
+        
         // Deserialize and parse the message.
-        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes) => {
-                record_batch_arrival(&digest);
-                record_batch_size_bytes(&digest, batch_size_bytes);
-                if first_tx_submit_ms > 0 { record_tx_submit_ms(&digest, first_tx_submit_ms); }
-                self
-                .tx_our_digests                                         //sender channel to Proposer
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests")
+        match bincode::deserialize(&serialized) {
+            Ok(message) => match message {
+                WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes) => {
+                    info!("✅ SUCCESS: Deserialized OurBatch from worker {} - digest: {}, size: {} bytes", 
+                          worker_id, digest, batch_size_bytes);
+                    record_batch_arrival(&digest);
+                    record_batch_size_bytes(&digest, batch_size_bytes);
+                    if first_tx_submit_ms > 0 { record_tx_submit_ms(&digest, first_tx_submit_ms); }
+                    
+                    info!("📤 Sending digest {} to Proposer via tx_our_digests channel", digest);
+                    let digest_copy = digest.clone();
+                    match self.tx_our_digests.send((digest, worker_id)).await {
+                        Ok(_) => info!("✅ Successfully sent digest {} to Proposer", digest_copy),
+                        Err(e) => error!("❌ Failed to send digest {} to Proposer: {}", digest_copy, e),
+                    }
+                },
+                WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes) => {
+                    info!("✅ SUCCESS: Deserialized OthersBatch from worker {} - digest: {}, size: {} bytes", 
+                          worker_id, digest, batch_size_bytes);
+                    record_batch_arrival(&digest);
+                    record_batch_size_bytes(&digest, batch_size_bytes);
+                    
+                    info!("📤 Sending digest {} to PayloadReceiver via tx_others_digests channel", digest);
+                    let digest_copy = digest.clone();
+                    match self.tx_others_digests.send((digest, worker_id)).await {
+                        Ok(_) => info!("✅ Successfully sent digest {} to PayloadReceiver", digest_copy),
+                        Err(e) => error!("❌ Failed to send digest {} to PayloadReceiver: {}", digest_copy, e),
+                    }
+                },
             },
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes) => {
-                record_batch_arrival(&digest);
-                record_batch_size_bytes(&digest, batch_size_bytes);
-                self
-                .tx_others_digests                                      //sender channel to PayloadReceiver
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests")
-            },
+            Err(e) => {
+                error!("❌ CRITICAL: Failed to deserialize WorkerPrimaryMessage from {} bytes: {:?}", 
+                       serialized.len(), e);
+                error!("❌ Raw bytes (first 100): {:?}", &serialized[..std::cmp::min(100, serialized.len())]);
+                return Err(Box::new(DagError::SerializationError(e)));
+            }
         }
         Ok(())
     }

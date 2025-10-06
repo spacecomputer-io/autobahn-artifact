@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use prometheus::{register_gauge, register_histogram, register_int_counter, register_int_gauge, register_histogram_vec, Gauge, Histogram, HistogramVec, IntCounter, IntGauge};
+use prometheus::{register_gauge, register_histogram, register_int_counter, register_histogram_vec, Gauge, Histogram, HistogramVec, IntCounter};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -61,40 +61,6 @@ lazy_static! {
         )
         .expect("failed to register primary_commits_total");
 
-    pub static ref PRIMARY_LAST_COMMITTED_HEIGHT: IntGauge =
-        register_int_gauge!(
-            "primary_last_committed_height",
-            "Latest committed height"
-        )
-        .expect("failed to register primary_last_committed_height");
-
-    pub static ref PRIMARY_CURRENT_HEIGHT: IntGauge =
-        register_int_gauge!(
-            "primary_current_height",
-            "Current proposer height"
-        )
-        .expect("failed to register primary_current_height");
-
-    pub static ref PRIMARY_LAST_DECIDED_VIEW: IntGauge =
-        register_int_gauge!(
-            "primary_last_decided_view",
-            "Last decided view recorded on commit"
-        )
-        .expect("failed to register primary_last_decided_view");
-
-    pub static ref PRIMARY_LAST_DECIDED_TIME_SECONDS: Gauge =
-        register_gauge!(
-            "primary_last_decided_time_seconds",
-            "Unix timestamp of last commit"
-        )
-        .expect("failed to register primary_last_decided_time_seconds");
-
-    pub static ref PRIMARY_VIEWS_PER_DECIDE: Histogram =
-        register_histogram!(
-            "primary_views_per_decide",
-            "Number of views progressed per decide event"
-        )
-        .expect("failed to register primary_views_per_decide");
 
     pub static ref PRIMARY_TIMEOUTS_TOTAL: IntCounter =
         register_int_counter!(
@@ -131,25 +97,6 @@ lazy_static! {
     static ref BATCH_ARRIVAL_TIMES: Mutex<HashMap<Digest, Instant>> = Mutex::new(HashMap::new());
     static ref SUBMIT_MS_BY_BATCH: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
     static ref BATCH_SIZE_BYTES_BY_DIGEST: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
-    static ref LAST_DECIDED_VIEW_TRACKER: Mutex<Option<u64>> = Mutex::new(None);
-    pub static ref PRIMARY_LATEST_HEADER_NUM_DIGESTS: IntGauge = register_int_gauge!(
-        "primary_latest_header_num_digests",
-        "Number of digests included in the most recent proposed header"
-    ).expect("failed to register primary_latest_header_num_digests");
-    pub static ref PRIMARY_COMMITTED_DIGESTS_PER_SEC: Gauge = register_gauge!(
-        "primary_committed_digests_per_sec",
-        "Approximate moving average of committed digests per second over a short window"
-    ).expect("failed to register primary_committed_digests_per_sec");
-    pub static ref PRIMARY_COMMITTED_BYTES_PER_SEC: Gauge = register_gauge!(
-        "primary_committed_bytes_per_sec",
-        "Approximate moving average of committed payload bytes per second over a short window"
-    ).expect("failed to register primary_committed_bytes_per_sec");
-    pub static ref PRIMARY_LAST_COMMITTED_BYTES: IntGauge = register_int_gauge!(
-        "primary_last_committed_bytes",
-        "Total payload bytes in the most recently committed header"
-    ).expect("failed to register primary_last_committed_bytes");
-    static ref COMMIT_WINDOW: Mutex<Vec<(Instant, usize)>> = Mutex::new(Vec::new());
-    static ref COMMIT_BYTES_WINDOW: Mutex<Vec<(Instant, u64)>> = Mutex::new(Vec::new());
 
     // Per-flush interval metrics
     pub static ref PRIMARY_FLUSH_INTERVAL_THROUGHPUT_DIGESTS: Gauge = register_gauge!(
@@ -202,47 +149,6 @@ pub fn observe_propose_to_commit_latency(header_id: &Digest) {
     }
 }
 
-pub fn update_last_decided_view(view: u64) {
-    let mut last = LAST_DECIDED_VIEW_TRACKER.lock().unwrap();
-    if let Some(prev) = *last {
-        let delta = if view >= prev { view - prev } else { 0 } as f64;
-        PRIMARY_VIEWS_PER_DECIDE.observe(delta);
-    }
-    *last = Some(view);
-    PRIMARY_LAST_DECIDED_VIEW.set(view as i64);
-}
-
-pub fn observe_header_num_digests(num_digests: usize) {
-    PRIMARY_NUM_DIGESTS_PER_HEADER.observe(num_digests as f64);
-    PRIMARY_LATEST_HEADER_NUM_DIGESTS.set(num_digests as i64);
-}
-
-pub fn observe_commit_digests_count(num_digests: usize) {
-    const WINDOW_SECS: f64 = 30.0;
-    let now = Instant::now();
-    let mut w = COMMIT_WINDOW.lock().unwrap();
-    w.push((now, num_digests));
-    // Prune old entries
-    let cutoff = now - std::time::Duration::from_secs(WINDOW_SECS as u64);
-    w.retain(|(t, _)| *t >= cutoff);
-    let total: usize = w.iter().map(|(_, c)| *c).sum();
-    let secs = if w.is_empty() { 1.0 } else { WINDOW_SECS };
-    PRIMARY_COMMITTED_DIGESTS_PER_SEC.set(total as f64 / secs);
-}
-
-pub fn observe_commit_bytes(bytes: u64) {
-    const WINDOW_SECS: f64 = 30.0;
-    let now = Instant::now();
-    let mut w = COMMIT_BYTES_WINDOW.lock().unwrap();
-    w.push((now, bytes));
-    // Prune old entries
-    let cutoff = now - std::time::Duration::from_secs(WINDOW_SECS as u64);
-    w.retain(|(t, _)| *t >= cutoff);
-    let total: u64 = w.iter().map(|(_, c)| *c).sum();
-    let secs = if w.is_empty() { 1.0 } else { WINDOW_SECS };
-    PRIMARY_COMMITTED_BYTES_PER_SEC.set(total as f64 / secs);
-    PRIMARY_LAST_COMMITTED_BYTES.set(bytes as i64);
-}
 
 pub fn record_batch_size_bytes(digest: &Digest, bytes: u64) {
     let mut map = BATCH_SIZE_BYTES_BY_DIGEST.lock().unwrap();

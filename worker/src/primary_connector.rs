@@ -1,6 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::worker::SerializedBatchDigestMessage;
 use bytes::Bytes;
+use log::{info, debug, warn, error};
 use network::SimpleSender;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::Receiver;
@@ -29,11 +30,20 @@ impl PrimaryConnector {
     }
 
     async fn run(&mut self) {
-        while let Some(digest) = self.rx_digest.recv().await {
+        info!("🚀 PrimaryConnector: Starting to listen for batch digests to send to primary {}", self.primary_address);
+        
+        while let Some(digest_message) = self.rx_digest.recv().await {
+            info!("📡 PrimaryConnector: Received {} bytes to send to primary {}", 
+                  digest_message.len(), self.primary_address);
+            
             // Send the digest through the network.
+            info!("🌐 PrimaryConnector: Sending WorkerPrimaryMessage via SimpleSender");
             self.network
-                .send(self.primary_address, Bytes::from(digest))
+                .send(self.primary_address, Bytes::from(digest_message))
                 .await;
+            info!("✅ PrimaryConnector: Message sent to primary (SimpleSender completed)");
         }
+        
+        warn!("🔚 PrimaryConnector: Channel closed, stopping message forwarding");
     }
 }
