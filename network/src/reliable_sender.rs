@@ -190,6 +190,11 @@ impl Connection {
         // which we are still waiting to receive an ACK.
         let mut pending_replies = VecDeque::new();
 
+        // Enable TCP_NODELAY to disable Nagle's algorithm for low-latency communication
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY for connection to {}: {}", self.address, e);
+        }
+
         let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
         let error = 'connection: loop {
             // Try to send all messages of the buffer.

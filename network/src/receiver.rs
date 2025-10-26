@@ -73,6 +73,12 @@ impl<Handler: MessageHandler> Receiver<Handler> {
     /// using the provided handler.
     async fn spawn_runner(socket: TcpStream, peer: SocketAddr, handler: Handler) {
         tokio::spawn(async move {
+            // Enable TCP_NODELAY to disable Nagle's algorithm for low-latency communication
+            // This is critical for high-throughput consensus protocols
+            if let Err(e) = socket.set_nodelay(true) {
+                warn!("Failed to set TCP_NODELAY for connection from {}: {}", peer, e);
+            }
+            
             let transport = Framed::new(socket, LengthDelimitedCodec::new());
             let (mut writer, mut reader) = transport.split();
             while let Some(frame) = reader.next().await {

@@ -19,7 +19,12 @@ use crypto::{Hash as _, Signature};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use log::{debug, error, warn};
-use crate::metrics::{PRIMARY_TIMEOUTS_TOTAL, PRIMARY_TIMEOUTS_AS_LEADER_TOTAL};
+use crate::metrics::{
+    PRIMARY_TIMEOUTS_TOTAL, PRIMARY_TIMEOUTS_AS_LEADER_TOTAL,
+    PRIMARY_VOTES_SENT_TOTAL, PRIMARY_VOTES_RECEIVED_TOTAL, PRIMARY_VOTES_REFUSED_TOTAL,
+    PRIMARY_VIEW_CHANGES_TOTAL, PRIMARY_LEADER_CHANGES_TOTAL,
+    PRIMARY_HEADER_SYNC_REQUESTS_SENT_TOTAL
+};
 use network::{CancelHandler, ReliableSender};
 use core::panic;
 use std::borrow::BorrowMut;
@@ -342,6 +347,7 @@ impl Core {
         if self.synchronizer.missing_payload(&header, sync).await? {
             //println!("Missing payload");
             debug!("Processing of {} suspended: missing payload", header);
+            PRIMARY_VOTES_REFUSED_TOTAL.with_label_values(&["missing_payload"]).inc();
             return Ok(());
         }
 
@@ -354,6 +360,7 @@ impl Core {
         {
             //println!("The parent is missing");
             debug!("The parent is missing, suspending processing");
+            PRIMARY_VOTES_REFUSED_TOTAL.with_label_values(&["missing_parent"]).inc();
             return Ok(());
         }
 
@@ -369,6 +376,7 @@ impl Core {
             // TODO: Use reputation
             //println!("Need to sync on missing tips, reschedule");
             debug!("Can't vote for prepare, need to sync on missing tips, suspending processing");
+            PRIMARY_VOTES_REFUSED_TOTAL.with_label_values(&["wrong_view"]).inc();
             return Ok(());
         }
 
@@ -443,11 +451,32 @@ impl Core {
                 &header,
                 &self.name,
                 &mut self.signature_service,
-                consensus_votes,
+                consensus_votes.clone(),
             )
             .await;
             //println!("Created vote");
             debug!("Created Vote {:?}", vote);
+
+            // Track vote sent - determine type based on consensus votes
+            let vote_type = if !consensus_votes.is_empty() {
+                // Look at first consensus vote to determine type
+                if let Some((slot, digest, _)) = consensus_votes.first() {
+                    if let Some(instance) = self.consensus_instances.get(&(*slot, digest.clone())) {
+                        match instance {
+                            ConsensusMessage::Prepare { .. } => "prepare",
+                            ConsensusMessage::Confirm { .. } => "confirm",
+                            _ => "consensus",
+                        }
+                    } else {
+                        "consensus"
+                    }
+                } else {
+                    "consensus"
+                }
+            } else {
+                "header" // Pure header vote with no consensus votes
+            };
+            PRIMARY_VOTES_SENT_TOTAL.with_label_values(&[vote_type]).inc();
 
             if vote.origin == self.name {
                 self.process_vote(vote, false)
@@ -529,6 +558,29 @@ impl Core {
     #[async_recursion]
     async fn process_vote(&mut self, vote: Vote, is_loopback: bool) -> DagResult<()> {
         debug!("Processing Vote {:?}", vote);
+
+        // Track vote received (only if not loopback and not from self)
+        if !is_loopback && vote.author != self.name {
+            let vote_type = if !vote.consensus_votes.is_empty() {
+                // Determine type from first consensus vote
+                if let Some((slot, digest, _)) = vote.consensus_votes.first() {
+                    if let Some(instance) = self.consensus_instances.get(&(*slot, digest.clone())) {
+                        match instance {
+                            ConsensusMessage::Prepare { .. } => "prepare",
+                            ConsensusMessage::Confirm { .. } => "confirm",
+                            _ => "consensus",
+                        }
+                    } else {
+                        "consensus"
+                    }
+                } else {
+                    "consensus"
+                }
+            } else {
+                "header"
+            };
+            PRIMARY_VOTES_RECEIVED_TOTAL.with_label_values(&[vote_type]).inc();
+        }
 
         // NOTE: If sending externally then need map of open consensus instances
 
@@ -1820,6 +1872,16 @@ impl Core {
         // Add the new vote to our aggregator and see if we have a quorum.
         if let Some(tc) = tc_maker.append(timeout.clone(), &self.committee)? {
             debug!("Assembled TimeoutCertificate {:?}", tc);
+
+            // Track view change
+            PRIMARY_VIEW_CHANGES_TOTAL.with_label_values(&[&timeout.slot.to_string()]).inc();
+
+            // Check if leader changed
+            let old_leader = self.leader_elector.get_leader(timeout.slot, timeout.view);
+            let new_leader = self.leader_elector.get_leader(timeout.slot, timeout.view + 1);
+            if old_leader != new_leader {
+                PRIMARY_LEADER_CHANGES_TOTAL.inc();
+            }
 
             // Try to advance the view
             self.views.insert(timeout.slot, timeout.view + 1);

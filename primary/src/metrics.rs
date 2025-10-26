@@ -1,5 +1,8 @@
 use lazy_static::lazy_static;
-use prometheus::{register_gauge, register_histogram, register_int_counter, register_histogram_vec, Gauge, Histogram, HistogramVec, IntCounter};
+use prometheus::{
+    register_gauge, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    Gauge, HistogramVec, IntCounter, IntCounterVec
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -11,9 +14,10 @@ pub struct FlushIntervalData {
     pub commit_count: u64,
     pub digest_count: u64,
     pub byte_count: u64,
-    pub propose_to_commit_latencies: Vec<f64>,
-    pub batch_ingress_to_commit_latencies: Vec<f64>,
-    pub tx_submit_to_commit_latencies: Vec<f64>,
+    pub transaction_count: u64,
+    pub propose_to_commit_latencies_ms: Vec<f64>,
+    pub batch_ingress_to_commit_latencies_ms: Vec<f64>,
+    pub tx_submit_to_commit_latencies_ms: Vec<f64>,
 }
 
 impl FlushIntervalData {
@@ -22,21 +26,23 @@ impl FlushIntervalData {
             commit_count: 0,
             digest_count: 0,
             byte_count: 0,
-            propose_to_commit_latencies: Vec::new(),
-            batch_ingress_to_commit_latencies: Vec::new(),
-            tx_submit_to_commit_latencies: Vec::new(),
+            transaction_count: 0,
+            propose_to_commit_latencies_ms: Vec::new(),
+            batch_ingress_to_commit_latencies_ms: Vec::new(),
+            tx_submit_to_commit_latencies_ms: Vec::new(),
         }
     }
-    
+
     pub fn reset(&mut self) {
         self.commit_count = 0;
         self.digest_count = 0;
         self.byte_count = 0;
-        self.propose_to_commit_latencies.clear();
-        self.batch_ingress_to_commit_latencies.clear();
-        self.tx_submit_to_commit_latencies.clear();
+        self.transaction_count = 0;
+        self.propose_to_commit_latencies_ms.clear();
+        self.batch_ingress_to_commit_latencies_ms.clear();
+        self.tx_submit_to_commit_latencies_ms.clear();
     }
-    
+
     pub fn calculate_avg_latency(latencies: &[f64]) -> f64 {
         if latencies.is_empty() {
             0.0
@@ -47,6 +53,10 @@ impl FlushIntervalData {
 }
 
 lazy_static! {
+    // ============================================================================
+    // EXISTING COUNTERS
+    // ============================================================================
+
     pub static ref PRIMARY_HEADERS_PROPOSED_TOTAL: IntCounter =
         register_int_counter!(
             "primary_headers_proposed_total",
@@ -60,7 +70,6 @@ lazy_static! {
             "Total number of headers committed by this primary"
         )
         .expect("failed to register primary_commits_total");
-
 
     pub static ref PRIMARY_TIMEOUTS_TOTAL: IntCounter =
         register_int_counter!(
@@ -76,62 +85,154 @@ lazy_static! {
         )
         .expect("failed to register primary_timeouts_as_leader_total");
 
-    pub static ref PRIMARY_LATENCY_SECONDS: HistogramVec =
-        register_histogram_vec!(
-            "primary_latency_seconds",
-            "Primary latencies by phase (seconds)",
-            &["phase"],
-            // quasi-log buckets from 1ms to 60s
-            vec![0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0]
-        )
-        .expect("failed to register primary_latency_seconds");
+    // ============================================================================
+    // NEW METRICS - Consensus
+    // ============================================================================
 
-    pub static ref PRIMARY_NUM_DIGESTS_PER_HEADER: Histogram =
-        register_histogram!(
-            "primary_num_digests_per_header",
-            "Number of worker digests included per proposed header"
-        )
-        .expect("failed to register primary_num_digests_per_header");
+    // Fast/Slow Path Tracking
+    pub static ref PRIMARY_FAST_PATH_COMMITS_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_fast_path_commits_total",
+            "Total number of commits via fast path"
+        ).expect("failed to register primary_fast_path_commits_total");
+
+    pub static ref PRIMARY_SLOW_PATH_COMMITS_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_slow_path_commits_total",
+            "Total number of commits via slow path"
+        ).expect("failed to register primary_slow_path_commits_total");
+
+    // View Changes
+    pub static ref PRIMARY_VIEW_CHANGES_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "primary_view_changes_total",
+            "Total number of view changes per slot",
+            &["slot"]
+        ).expect("failed to register primary_view_changes_total");
+
+    pub static ref PRIMARY_LEADER_CHANGES_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_leader_changes_total",
+            "Total number of leader changes"
+        ).expect("failed to register primary_leader_changes_total");
+
+    // Vote Tracking
+    pub static ref PRIMARY_VOTES_SENT_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "primary_votes_sent_total",
+            "Total number of votes sent by type",
+            &["type"]
+        ).expect("failed to register primary_votes_sent_total");
+
+    pub static ref PRIMARY_VOTES_RECEIVED_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "primary_votes_received_total",
+            "Total number of votes received by type",
+            &["type"]
+        ).expect("failed to register primary_votes_received_total");
+
+    pub static ref PRIMARY_VOTES_REFUSED_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "primary_votes_refused_total",
+            "Total number of votes refused by reason",
+            &["reason"]
+        ).expect("failed to register primary_votes_refused_total");
+
+    // Synchronization
+    pub static ref PRIMARY_HEADER_SYNC_REQUESTS_SENT_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_header_sync_requests_sent_total",
+            "Total number of header sync requests sent"
+        ).expect("failed to register primary_header_sync_requests_sent_total");
+
+    pub static ref PRIMARY_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_header_sync_requests_received_total",
+            "Total number of header sync requests received"
+        ).expect("failed to register primary_header_sync_requests_received_total");
+
+    pub static ref PRIMARY_HEADER_SYNC_FAILURES_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "primary_header_sync_failures_total",
+            "Total number of header sync failures by reason",
+            &["reason"]
+        ).expect("failed to register primary_header_sync_failures_total");
+
+    // ============================================================================
+    // LATENCY METRICS - Now in Milliseconds
+    // ============================================================================
+
+    pub static ref PRIMARY_LATENCY_MS: HistogramVec =
+        register_histogram_vec!(
+            "primary_latency_ms",
+            "Primary latencies by phase (milliseconds)",
+            &["phase"],
+            // Buckets from 1ms to 60000ms (60 seconds)
+            vec![1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0,
+                 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 60000.0]
+        ).expect("failed to register primary_latency_ms");
+
+    // ============================================================================
+    // THROUGHPUT METRICS - Flush Interval Gauges
+    // ============================================================================
+
+    pub static ref PRIMARY_FLUSH_INTERVAL_THROUGHPUT_COMMITS: Gauge =
+        register_gauge!(
+            "primary_flush_interval_throughput_commits",
+            "Number of commits in the last flush interval"
+        ).expect("failed to register primary_flush_interval_throughput_commits");
+
+    pub static ref PRIMARY_FLUSH_INTERVAL_THROUGHPUT_DIGESTS: Gauge =
+        register_gauge!(
+            "primary_flush_interval_throughput_digests",
+            "Number of digests committed in the last flush interval"
+        ).expect("failed to register primary_flush_interval_throughput_digests");
+
+    pub static ref PRIMARY_FLUSH_INTERVAL_THROUGHPUT_BYTES: Gauge =
+        register_gauge!(
+            "primary_flush_interval_throughput_bytes",
+            "Total bytes committed in the last flush interval"
+        ).expect("failed to register primary_flush_interval_throughput_bytes");
+
+    pub static ref PRIMARY_FLUSH_INTERVAL_THROUGHPUT_TRANSACTIONS: Gauge =
+        register_gauge!(
+            "primary_flush_interval_throughput_transactions",
+            "Total transactions committed in the last flush interval"
+        ).expect("failed to register primary_flush_interval_throughput_transactions");
+
+    // Rates (computed)
+    pub static ref PRIMARY_COMMIT_RATE_PER_SECOND: Gauge =
+        register_gauge!(
+            "primary_commit_rate_per_second",
+            "Commits per second in the last flush interval"
+        ).expect("failed to register primary_commit_rate_per_second");
+
+    pub static ref PRIMARY_THROUGHPUT_BYTES_PER_SECOND: Gauge =
+        register_gauge!(
+            "primary_throughput_bytes_per_second",
+            "Bytes per second in the last flush interval"
+        ).expect("failed to register primary_throughput_bytes_per_second");
+
+    pub static ref PRIMARY_THROUGHPUT_TX_PER_SECOND: Gauge =
+        register_gauge!(
+            "primary_throughput_tx_per_second",
+            "Transactions per second in the last flush interval"
+        ).expect("failed to register primary_throughput_tx_per_second");
+
+    // ============================================================================
+    // Internal State for Tracking
+    // ============================================================================
 
     static ref PROPOSE_TIMES: Mutex<HashMap<Digest, Instant>> = Mutex::new(HashMap::new());
     static ref BATCH_ARRIVAL_TIMES: Mutex<HashMap<Digest, Instant>> = Mutex::new(HashMap::new());
     static ref SUBMIT_MS_BY_BATCH: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
     static ref BATCH_SIZE_BYTES_BY_DIGEST: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
-
-    // Per-flush interval metrics
-    pub static ref PRIMARY_FLUSH_INTERVAL_THROUGHPUT_DIGESTS: Gauge = register_gauge!(
-        "primary_flush_interval_throughput_digests",
-        "Number of digests committed during the last flush interval"
-    ).expect("failed to register primary_flush_interval_throughput_digests");
-    
-    pub static ref PRIMARY_FLUSH_INTERVAL_THROUGHPUT_BYTES: Gauge = register_gauge!(
-        "primary_flush_interval_throughput_bytes", 
-        "Total bytes committed during the last flush interval"
-    ).expect("failed to register primary_flush_interval_throughput_bytes");
-    
-    pub static ref PRIMARY_FLUSH_INTERVAL_THROUGHPUT_COMMITS: Gauge = register_gauge!(
-        "primary_flush_interval_throughput_commits",
-        "Number of headers committed during the last flush interval"
-    ).expect("failed to register primary_flush_interval_throughput_commits");
-    
-    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_PROPOSE_TO_COMMIT_AVG: Gauge = register_gauge!(
-        "primary_flush_interval_latency_propose_to_commit_avg_seconds",
-        "Average propose-to-commit latency during the last flush interval"
-    ).expect("failed to register primary_flush_interval_latency_propose_to_commit_avg");
-    
-    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_BATCH_INGRESS_TO_COMMIT_AVG: Gauge = register_gauge!(
-        "primary_flush_interval_latency_batch_ingress_to_commit_avg_seconds",
-        "Average batch-ingress-to-commit latency during the last flush interval"
-    ).expect("failed to register primary_flush_interval_latency_batch_ingress_to_commit_avg");
-    
-    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_TX_SUBMIT_TO_COMMIT_AVG: Gauge = register_gauge!(
-        "primary_flush_interval_latency_tx_submit_to_commit_avg_seconds",
-        "Average tx-submit-to-commit latency during the last flush interval"
-    ).expect("failed to register primary_flush_interval_latency_tx_submit_to_commit_avg");
-
-    // Storage for accumulating flush interval data
     static ref FLUSH_INTERVAL_DATA: Mutex<FlushIntervalData> = Mutex::new(FlushIntervalData::new());
 }
+
+// ============================================================================
+// Helper Functions - Latency Tracking (Now in Milliseconds)
+// ============================================================================
 
 pub fn record_propose_time(header_id: &Digest) {
     let mut map = PROPOSE_TIMES.lock().unwrap();
@@ -141,23 +242,13 @@ pub fn record_propose_time(header_id: &Digest) {
 pub fn observe_propose_to_commit_latency(header_id: &Digest) {
     let mut map = PROPOSE_TIMES.lock().unwrap();
     if let Some(start) = map.remove(header_id) {
-        let secs = start.elapsed().as_secs_f64();
-        PRIMARY_LATENCY_SECONDS.with_label_values(&["propose_to_commit"]).observe(secs);
-        
-        // Also accumulate for flush interval metrics
-        record_flush_interval_propose_to_commit_latency(secs);
+        let latency_ms = start.elapsed().as_millis() as f64;
+        PRIMARY_LATENCY_MS.with_label_values(&["propose_to_commit"]).observe(latency_ms);
+
+        // Also accumulate for flush interval
+        let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
+        flush_data.propose_to_commit_latencies_ms.push(latency_ms);
     }
-}
-
-
-pub fn record_batch_size_bytes(digest: &Digest, bytes: u64) {
-    let mut map = BATCH_SIZE_BYTES_BY_DIGEST.lock().unwrap();
-    map.insert(digest.clone(), bytes);
-}
-
-pub fn take_batch_size_bytes(digest: &Digest) -> u64 {
-    let mut map = BATCH_SIZE_BYTES_BY_DIGEST.lock().unwrap();
-    map.remove(digest).unwrap_or(0)
 }
 
 pub fn record_batch_arrival(digest: &Digest) {
@@ -168,11 +259,11 @@ pub fn record_batch_arrival(digest: &Digest) {
 pub fn observe_batch_ingress_to_commit_latency(digest: &Digest) {
     let mut map = BATCH_ARRIVAL_TIMES.lock().unwrap();
     if let Some(start) = map.remove(digest) {
-        let secs = start.elapsed().as_secs_f64();
-        PRIMARY_LATENCY_SECONDS.with_label_values(&["batch_ingress_to_commit"]).observe(secs);
-        
-        // Also accumulate for flush interval metrics
-        record_flush_interval_batch_ingress_to_commit_latency(secs);
+        let latency_ms = start.elapsed().as_millis() as f64;
+        PRIMARY_LATENCY_MS.with_label_values(&["batch_ingress_to_commit"]).observe(latency_ms);
+
+        let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
+        flush_data.batch_ingress_to_commit_latencies_ms.push(latency_ms);
     }
 }
 
@@ -186,56 +277,65 @@ pub fn observe_tx_submit_to_commit_latency(digest: &Digest) {
     if let Some(start_ms) = map.remove(digest) {
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         if now_ms >= start_ms {
-            let delta_secs = (now_ms - start_ms) as f64 / 1000.0;
-            PRIMARY_LATENCY_SECONDS.with_label_values(&["tx_submit_to_commit"]).observe(delta_secs);
-            
-            // Also accumulate for flush interval metrics
+            let latency_ms = (now_ms - start_ms) as f64;
+            PRIMARY_LATENCY_MS.with_label_values(&["tx_submit_to_commit"]).observe(latency_ms);
+
             let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
-            flush_data.tx_submit_to_commit_latencies.push(delta_secs);
+            flush_data.tx_submit_to_commit_latencies_ms.push(latency_ms);
         }
     }
 }
 
-/// Record a commit event for flush interval metrics
+// ============================================================================
+// Helper Functions - Batch Size Tracking
+// ============================================================================
+
+pub fn record_batch_size_bytes(digest: &Digest, bytes: u64) {
+    let mut map = BATCH_SIZE_BYTES_BY_DIGEST.lock().unwrap();
+    map.insert(digest.clone(), bytes);
+}
+
+pub fn take_batch_size_bytes(digest: &Digest) -> u64 {
+    let mut map = BATCH_SIZE_BYTES_BY_DIGEST.lock().unwrap();
+    map.remove(digest).unwrap_or(0)
+}
+
+// ============================================================================
+// Helper Functions - Flush Interval Tracking
+// ============================================================================
+
 pub fn record_flush_interval_commit(num_digests: usize, bytes: u64) {
     let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
     flush_data.commit_count += 1;
     flush_data.digest_count += num_digests as u64;
     flush_data.byte_count += bytes;
+    // Note: transaction_count would need to be passed in or computed separately
 }
 
-/// Record a propose-to-commit latency for flush interval metrics
-pub fn record_flush_interval_propose_to_commit_latency(latency_secs: f64) {
+/// Calculate rates and update flush interval metrics, then reset the accumulator
+/// Called every flush_interval_ms (default 5000ms)
+pub fn flush_interval_metrics(interval_ms: u64) {
     let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
-    flush_data.propose_to_commit_latencies.push(latency_secs);
-}
 
-/// Record a batch-ingress-to-commit latency for flush interval metrics
-pub fn record_flush_interval_batch_ingress_to_commit_latency(latency_secs: f64) {
-    let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
-    flush_data.batch_ingress_to_commit_latencies.push(latency_secs);
-}
-
-/// Calculate averages and update flush interval metrics, then reset the accumulator
-pub fn flush_interval_metrics() {
-    let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
-    
-    // Update throughput metrics
+    // Update throughput counts
     PRIMARY_FLUSH_INTERVAL_THROUGHPUT_COMMITS.set(flush_data.commit_count as f64);
     PRIMARY_FLUSH_INTERVAL_THROUGHPUT_DIGESTS.set(flush_data.digest_count as f64);
     PRIMARY_FLUSH_INTERVAL_THROUGHPUT_BYTES.set(flush_data.byte_count as f64);
-    
-    // Calculate and update average latency metrics
-    let avg_propose_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.propose_to_commit_latencies);
-    let avg_batch_ingress_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.batch_ingress_to_commit_latencies);
-    let avg_tx_submit_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.tx_submit_to_commit_latencies);
-    
-    PRIMARY_FLUSH_INTERVAL_LATENCY_PROPOSE_TO_COMMIT_AVG.set(avg_propose_to_commit);
-    PRIMARY_FLUSH_INTERVAL_LATENCY_BATCH_INGRESS_TO_COMMIT_AVG.set(avg_batch_ingress_to_commit);
-    PRIMARY_FLUSH_INTERVAL_LATENCY_TX_SUBMIT_TO_COMMIT_AVG.set(avg_tx_submit_to_commit);
-    
-    // Reset for next flush interval
+    PRIMARY_FLUSH_INTERVAL_THROUGHPUT_TRANSACTIONS.set(flush_data.transaction_count as f64);
+
+    // Calculate rates (per second)
+    let interval_sec = interval_ms as f64 / 1000.0;
+    if interval_sec > 0.0 {
+        PRIMARY_COMMIT_RATE_PER_SECOND.set(flush_data.commit_count as f64 / interval_sec);
+        PRIMARY_THROUGHPUT_BYTES_PER_SECOND.set(flush_data.byte_count as f64 / interval_sec);
+        PRIMARY_THROUGHPUT_TX_PER_SECOND.set(flush_data.transaction_count as f64 / interval_sec);
+    }
+
+    // Reset for next interval
     flush_data.reset();
 }
+
+
+
 
 

@@ -268,7 +268,7 @@ async fn start_metrics_file_flusher(
         let encoder = TextEncoder::new();
         loop {
             // Calculate averages and reset flush interval metrics before gathering
-            flush_interval_metrics();
+            flush_interval_metrics(flush_interval_ms);
             
             let metric_families = registry.gather();
             let mut buffer = Vec::new();

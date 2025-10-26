@@ -6,6 +6,7 @@ use crate::{DagError, Height};
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
 use crate::messages::{Certificate, ConsensusMessage, Header, Proposal};
+use crate::metrics::PRIMARY_HEADER_SYNC_REQUESTS_SENT_TOTAL;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
@@ -80,6 +81,9 @@ impl Synchronizer {
             return Ok(false);
         }
 
+        // Track sync request sent
+        PRIMARY_HEADER_SYNC_REQUESTS_SENT_TOTAL.inc();
+
         self.tx_header_waiter
             .send(WaiterMessage::SyncBatches(missing, header.clone(), force_sync))
             .await
@@ -88,6 +92,9 @@ impl Synchronizer {
     }
 
     pub async fn fetch_header(&mut self, header_digest: Digest) -> DagResult<()> {
+        // Track sync request sent
+        PRIMARY_HEADER_SYNC_REQUESTS_SENT_TOTAL.inc();
+
         self.tx_header_waiter
             .send(WaiterMessage::SyncHeader(header_digest))
             .await
