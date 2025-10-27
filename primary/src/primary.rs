@@ -107,6 +107,8 @@ impl Primary {
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
         let (_tx_mempool, rx_mempool) = channel(CHANNEL_CAPACITY);
 
+        // VERSION IDENTIFIER - Log version to verify which code is running
+        info!("🚀 PRIMARY VERSION: prometheus-metrics-csv-export-v1");
 
         // Write the parameters to the logs.
         // NOTE: These log entries are needed to compute performance.

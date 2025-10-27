@@ -72,6 +72,9 @@ impl Worker {
             store,
         };
 
+        // VERSION IDENTIFIER - Log version to verify which code is running
+        info!("🚀 WORKER {} VERSION: prometheus-metrics-csv-export-v1", id);
+
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
         worker.handle_primary_messages();                         //spawns async task that listens for network message from Primary
