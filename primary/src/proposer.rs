@@ -6,9 +6,7 @@ use crate::messages::{Certificate, Header, ConsensusMessage};
 use crate::primary::Height;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService, Hash};
-use log::debug;
-#[cfg(feature = "benchmark")]
-use log::info;
+use log::{debug, info, warn, error};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 use crate::metrics::{PRIMARY_HEADERS_PROPOSED_TOTAL, record_propose_time};
@@ -103,30 +101,11 @@ impl Proposer {
     
     async fn make_header(&mut self) {
         // Make a new header.
-        debug!("digests size before is {:?}", self.digests.len());
-        /*let mut header: Header;
-        if self.digests.len() > 0 {
-            header = Header::new(
-                self.name,
-                self.height,
-                self.digests.drain(..1).collect(),
-                self.last_parent.clone().unwrap(),
-                &mut self.signature_service,
-                self.consensus_instances.clone(),
-                self.num_active_instances,
-            ).await;
-        } else {
-            header = Header::new(
-                self.name,
-                self.height,
-                BTreeMap::new(),
-                self.last_parent.clone().unwrap(),
-                &mut self.signature_service,
-                self.consensus_instances.clone(),
-                self.num_active_instances,
-            ).await;
-
-        }*/
+        let num_batches = self.digests.len();
+        let num_consensus_msgs = self.consensus_instances.len();
+        
+        debug!("Creating header at height {} with {} batches, {} consensus instances", 
+               self.height, num_batches, num_consensus_msgs);
 
         let mut header = Header::new(
                 self.name,
@@ -138,18 +117,9 @@ impl Proposer {
                 self.num_active_instances,
             ).await;
 
-
         if self.is_special {
             header.special = true;
-            //TODO: need to also include the digest of the last proposal. Otherwise there is no gain in latency for that tx.
-              // Instead of including Certificate as parent => include digest.
-        }
-
-
-        debug!("Created {:?}", header);
-
-        for (digest, _) in &header.consensus_messages {
-           debug!("Header has {:?}", digest);
+            debug!("Header at height {} is SPECIAL", self.height);
         }
 
         #[cfg(feature = "benchmark")]
@@ -167,25 +137,37 @@ impl Proposer {
         // Send the new header to the `Core` that will broadcast and process it.
         record_propose_time(&header.id);
 
-        self.tx_core
-            .send(header)
-            .await
-            .expect("Failed to send header");
-
-        PRIMARY_HEADERS_PROPOSED_TOTAL.inc();
-        // Record start time for propose->commit latency using header id.
-        // Safety: header id is deterministic and unique within this process.
-        // We already moved header into channel, so use last known id via last_parent for tracking if available.
-        // Here, we simply record by the last proposed header id via the channel send above by cloning before.
+        match self.tx_core.try_send(header) {
+            Ok(_) => {
+                PRIMARY_HEADERS_PROPOSED_TOTAL.inc();
+            },
+            Err(tokio::sync::mpsc::error::TrySendError::Full(h)) => {
+                warn!("PROPOSER: tx_core channel FULL at height {}! Core may be overloaded processing headers", self.height);
+                if let Err(e) = self.tx_core.send(h).await {
+                    error!("PROPOSER: CRITICAL - Failed to send header at height {}: {}", self.height, e);
+                }
+                PRIMARY_HEADERS_PROPOSED_TOTAL.inc();
+            },
+            Err(e) => {
+                error!("PROPOSER: CRITICAL - Channel closed at height {}: {}", self.height, e);
+            }
+        }
     }
 
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
-        debug!("Dag starting at round {}", self.height);
+        debug!("Proposer starting at height {}", self.height);
 
         let timer = sleep(Duration::from_millis(self.max_header_delay));
         tokio::pin!(timer);
         let mut current_time = Instant::now();
+        
+        // Stats tracking
+        let mut headers_proposed: u64 = 0;
+        let mut batches_included: u64 = 0;
+        let mut last_stats_log = Instant::now();
+        let mut waiting_for_parent_since: Option<Instant> = None;
+        let mut waiting_for_batches_since: Option<Instant> = None;
 
         loop {
             // Check if we can propose a new header. We propose a new header when one of the following
@@ -195,50 +177,78 @@ impl Proposer {
             // inter-header delay has passed.
             // 3. If it is a special block opportunity. That is when either a QC or TC from the previous view forms,
             // we have a ticket to propose a new block
-            // For both normal blocks and special blocks, delegate the actual sending to the consensus module
-            // in other words core should not be disseminating headers
-            //let enough_parents = !self.last_parent.is_empty();
             let enough_parent = self.last_parent.is_some();
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
 
             if (timer_expired || enough_digests) && (enough_parent || self.is_special) {
                 if timer_expired {
-                    debug!("Timer expired for height {}", self.height);
+                    debug!("Timer expired for height {} - proposing with {} batches ({} bytes)", 
+                           self.height, self.digests.len(), self.payload_size);
                 }
 
-                debug!("New car proposed after {:?} ms", current_time.elapsed().as_millis());
-                debug!("is special is {:?}", self.is_special);
+                let elapsed = current_time.elapsed().as_millis();
+                debug!("Proposing header at height {} after {:?} ms (special={})", 
+                       self.height, elapsed, self.is_special);
                 current_time = Instant::now();
                 
                 // Make a new header.
+                batches_included += self.digests.len() as u64;
                 self.make_header().await;
+                headers_proposed += 1;
                 self.payload_size = 0;
+                
+                // Reset wait timers
+                waiting_for_parent_since = None;
+                waiting_for_batches_since = None;
 
                 // Reschedule the timer.
                 let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                 timer.as_mut().reset(deadline);
+            } else {
+                // Track how long we're waiting for resources
+                if !enough_parent && waiting_for_parent_since.is_none() {
+                    waiting_for_parent_since = Some(Instant::now());
+                }
+                if enough_parent && !enough_digests && waiting_for_batches_since.is_none() {
+                    waiting_for_batches_since = Some(Instant::now());
+                }
+                
+                // Warn if stuck waiting too long
+                if let Some(wait_start) = waiting_for_parent_since {
+                    if wait_start.elapsed().as_secs() >= 3 {
+                        warn!("PROPOSER: Waiting for parent certificate for {} seconds at height {}", 
+                              wait_start.elapsed().as_secs(), self.height);
+                        waiting_for_parent_since = Some(Instant::now()); // Reset to avoid spam
+                    }
+                }
+                if let Some(wait_start) = waiting_for_batches_since {
+                    if wait_start.elapsed().as_secs() >= 3 {
+                        warn!("PROPOSER: Waiting for batches for {} seconds at height {} (have {} bytes of {} needed)", 
+                              wait_start.elapsed().as_secs(), self.height, self.payload_size, self.header_size);
+                        waiting_for_batches_since = Some(Instant::now()); // Reset to avoid spam
+                    }
+                }
             }
 
     
             tokio::select! {
                 // Received info from consensus
                 Some(info) = self.rx_instance.recv() => {
-                    debug!("received consensus info");
-
                     match &info {
-                        ConsensusMessage::Prepare { slot, view, tc: _, qc_ticket: _, proposals: _} => {
+                        ConsensusMessage::Prepare { slot, view: _, tc: _, qc_ticket: _, proposals: _} => {
                             if self.use_special_rule {
                                 self.is_special = true;
                             }
                             self.num_active_instances +=1;
-                            debug!("prepare has digest: {}", info.digest());
+                            debug!("Received Prepare for slot {} (active instances: {})", slot, self.num_active_instances);
                         },
-                        ConsensusMessage::Confirm { slot: _, view: _, qc: _, proposals: _} => {
+                        ConsensusMessage::Confirm { slot, view: _, qc: _, proposals: _} => {
                             if self.use_special_rule {
                                 self.is_special = true;
                             }
                             self.num_active_instances +=1;
+                            debug!("Received Confirm for slot {} (active instances: {})", slot, self.num_active_instances);
                         },
                         _ => {},
                     }
@@ -248,28 +258,45 @@ impl Proposer {
 
                 // Receive own certificate from core (we are the author)
                 Some(parent) = self.rx_core.recv() => {
-                    debug!("   received parent from height {:?}", parent.height);
-
                     if parent.height < self.height {
+                        debug!("Ignoring stale parent from height {} (current: {})", parent.height, self.height);
                         continue;
                     }
 
                     // Advance to the next height.
                     self.height += 1;
-                    debug!("Chain moved to height {}", self.height);
+                    debug!("Chain advanced to height {} (parent from height {})", self.height, parent.height);
 
                     // Signal that we have a parent certificates to propose a new header.
                     self.last_parent = Some(parent.clone());
+                    waiting_for_parent_since = None;
                 }
 
                 Some((digest, worker_id)) = self.rx_workers.recv() => {
-                    //println!("   received payload from worker {}", worker_id);
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
+                    
+                    if waiting_for_batches_since.is_some() && self.payload_size >= self.header_size {
+                        debug!("Batch threshold reached: {} bytes from {} batches", 
+                               self.payload_size, self.digests.len());
+                        waiting_for_batches_since = None;
+                    }
                 }
                 () = &mut timer => {
-                    // Nothing to do.
+                    // Nothing to do - handled above
                 }
+            }
+            
+            // Log aggregate stats every 10 seconds
+            if last_stats_log.elapsed().as_secs() >= 10 {
+                let header_rate = headers_proposed as f64 / last_stats_log.elapsed().as_secs_f64();
+                let batch_rate = batches_included as f64 / last_stats_log.elapsed().as_secs_f64();
+                info!("PROPOSER: Proposed {} headers ({:.2} hdr/s) with {} batches ({:.1} batch/s) in last {:.1}s - Current height: {}", 
+                      headers_proposed, header_rate, batches_included, batch_rate, 
+                      last_stats_log.elapsed().as_secs_f64(), self.height);
+                headers_proposed = 0;
+                batches_included = 0;
+                last_stats_log = Instant::now();
             }
         }
     }

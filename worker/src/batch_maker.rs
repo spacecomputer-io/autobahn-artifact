@@ -87,6 +87,9 @@ impl BatchMaker {
         let timer = sleep(Duration::from_millis(self.max_batch_delay));
         tokio::pin!(timer);
         let mut current_time = Instant::now();
+        let mut tx_count: u64 = 0;
+        let mut batch_sealed_count: u64 = 0;
+        let mut last_stats_log = Instant::now();
 
         loop {
             tokio::select! {
@@ -98,10 +101,13 @@ impl BatchMaker {
                     }
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
+                    tx_count += 1;
+                    
                     if self.current_batch_size >= self.batch_size {
                         self.seal().await;
+                        batch_sealed_count += 1;
 
-                        debug!("batch ready it took {:?} ms", current_time.elapsed().as_millis());
+                        debug!("Batch sealed in {:?} ms", current_time.elapsed().as_millis());
                         current_time = Instant::now();
 
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
@@ -110,14 +116,26 @@ impl BatchMaker {
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
-                    debug!("BatchMaker: max batch delay timer triggered");
                     if !self.current_batch.is_empty() {
+                        debug!("BatchMaker: Timer triggered, sealing partial batch ({} bytes)", self.current_batch_size);
                         self.seal().await;
+                        batch_sealed_count += 1;
                     }
 
                     current_time = Instant::now();
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                 }
+            }
+            
+            // Log aggregate stats every 5 seconds
+            if last_stats_log.elapsed().as_secs() >= 5 {
+                let tx_rate = tx_count as f64 / last_stats_log.elapsed().as_secs_f64();
+                let batch_rate = batch_sealed_count as f64 / last_stats_log.elapsed().as_secs_f64();
+                info!("BatchMaker: Received {} txs ({:.1} tx/s), sealed {} batches ({:.2} batch/s) in last {:.1}s", 
+                      tx_count, tx_rate, batch_sealed_count, batch_rate, last_stats_log.elapsed().as_secs_f64());
+                tx_count = 0;
+                batch_sealed_count = 0;
+                last_stats_log = Instant::now();
             }
 
             // Give the change to schedule other tasks.

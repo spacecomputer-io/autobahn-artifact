@@ -30,20 +30,30 @@ impl PrimaryConnector {
     }
 
     async fn run(&mut self) {
-        info!("🚀 PrimaryConnector: Starting to listen for batch digests to send to primary {}", self.primary_address);
+        info!("PrimaryConnector: Connected to primary at {}", self.primary_address);
+        
+        let mut msg_count: u64 = 0;
+        let mut last_log_time = std::time::Instant::now();
         
         while let Some(digest_message) = self.rx_digest.recv().await {
-            info!("📡 PrimaryConnector: Received {} bytes to send to primary {}", 
-                  digest_message.len(), self.primary_address);
+            let msg_size = digest_message.len();
+            msg_count += 1;
             
             // Send the digest through the network.
-            info!("🌐 PrimaryConnector: Sending WorkerPrimaryMessage via SimpleSender");
             self.network
                 .send(self.primary_address, Bytes::from(digest_message))
                 .await;
-            info!("✅ PrimaryConnector: Message sent to primary (SimpleSender completed)");
+            
+            // Log aggregate stats every 5 seconds to reduce log spam
+            if last_log_time.elapsed().as_secs() >= 5 {
+                let rate = msg_count as f64 / last_log_time.elapsed().as_secs_f64();
+                info!("PrimaryConnector: Sent {} digests to primary ({:.2} digests/s) in last {:.1}s", 
+                      msg_count, rate, last_log_time.elapsed().as_secs_f64());
+                msg_count = 0;
+                last_log_time = std::time::Instant::now();
+            }
         }
         
-        warn!("🔚 PrimaryConnector: Channel closed, stopping message forwarding");
+        warn!("PrimaryConnector: Channel closed, stopping");
     }
 }

@@ -333,43 +333,56 @@ impl MessageHandler for WorkerReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        info!("🔍 WorkerReceiverHandler: Received {} bytes from worker", serialized.len());
-        
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
             Ok(message) => match message {
                 WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes) => {
-                    info!("✅ SUCCESS: Deserialized OurBatch from worker {} - digest: {}, size: {} bytes", 
-                          worker_id, digest, batch_size_bytes);
                     record_batch_arrival(&digest);
                     record_batch_size_bytes(&digest, batch_size_bytes);
                     if first_tx_submit_ms > 0 { record_tx_submit_ms(&digest, first_tx_submit_ms); }
                     
-                    info!("📤 Sending digest {} to Proposer via tx_our_digests channel", digest);
+                    // Use try_send to detect channel backpressure
                     let digest_copy = digest.clone();
-                    match self.tx_our_digests.send((digest, worker_id)).await {
-                        Ok(_) => info!("✅ Successfully sent digest {} to Proposer", digest_copy),
-                        Err(e) => error!("❌ Failed to send digest {} to Proposer: {}", digest_copy, e),
+                    match self.tx_our_digests.try_send((digest, worker_id)) {
+                        Ok(_) => {},
+                        Err(tokio::sync::mpsc::error::TrySendError::Full((d, wid))) => {
+                            warn!("PRIMARY: tx_our_digests channel FULL! Worker {} batch {} blocked - Proposer may be overloaded", 
+                                  wid, d);
+                            // Fallback to blocking send
+                            if let Err(e) = self.tx_our_digests.send((d, wid)).await {
+                                error!("PRIMARY: CRITICAL - Failed to send OurBatch {} from worker {}: {}", digest_copy, wid, e);
+                            }
+                        },
+                        Err(e) => {
+                            error!("PRIMARY: CRITICAL - Channel closed for OurBatch {} from worker {}: {}", digest_copy, worker_id, e);
+                        }
                     }
                 },
                 WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes) => {
-                    info!("✅ SUCCESS: Deserialized OthersBatch from worker {} - digest: {}, size: {} bytes", 
-                          worker_id, digest, batch_size_bytes);
                     record_batch_arrival(&digest);
                     record_batch_size_bytes(&digest, batch_size_bytes);
                     
-                    info!("📤 Sending digest {} to PayloadReceiver via tx_others_digests channel", digest);
+                    // Use try_send to detect channel backpressure
                     let digest_copy = digest.clone();
-                    match self.tx_others_digests.send((digest, worker_id)).await {
-                        Ok(_) => info!("✅ Successfully sent digest {} to PayloadReceiver", digest_copy),
-                        Err(e) => error!("❌ Failed to send digest {} to PayloadReceiver: {}", digest_copy, e),
+                    match self.tx_others_digests.try_send((digest, worker_id)) {
+                        Ok(_) => {},
+                        Err(tokio::sync::mpsc::error::TrySendError::Full((d, wid))) => {
+                            warn!("PRIMARY: tx_others_digests channel FULL! Worker {} batch {} blocked - PayloadReceiver may be overloaded", 
+                                  wid, d);
+                            // Fallback to blocking send
+                            if let Err(e) = self.tx_others_digests.send((d, wid)).await {
+                                error!("PRIMARY: CRITICAL - Failed to send OthersBatch {} from worker {}: {}", digest_copy, wid, e);
+                            }
+                        },
+                        Err(e) => {
+                            error!("PRIMARY: CRITICAL - Channel closed for OthersBatch {} from worker {}: {}", digest_copy, worker_id, e);
+                        }
                     }
                 },
             },
             Err(e) => {
-                error!("❌ CRITICAL: Failed to deserialize WorkerPrimaryMessage from {} bytes: {:?}", 
+                error!("PRIMARY: CRITICAL - Failed to deserialize WorkerPrimaryMessage from {} bytes: {:?}", 
                        serialized.len(), e);
-                error!("❌ Raw bytes (first 100): {:?}", &serialized[..std::cmp::min(100, serialized.len())]);
                 return Err(Box::new(DagError::SerializationError(e)));
             }
         }

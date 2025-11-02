@@ -18,7 +18,7 @@ use crypto::{Digest, PublicKey, SignatureService};
 use crypto::{Hash as _, Signature};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
-use log::{debug, error, warn};
+use log::{debug, error, warn, info};
 use crate::metrics::{
     PRIMARY_TIMEOUTS_TOTAL, PRIMARY_TIMEOUTS_AS_LEADER_TOTAL,
     PRIMARY_VOTES_SENT_TOTAL, PRIMARY_VOTES_RECEIVED_TOTAL, PRIMARY_VOTES_REFUSED_TOTAL,
@@ -2131,19 +2131,56 @@ impl Core {
             .await
             .expect("failed to send cert to proposer");
 
+        // Diagnostic tracking variables
+        let mut headers_processed: u64 = 0;
+        let mut votes_processed: u64 = 0;
+        let mut certificates_processed: u64 = 0;
+        let mut consensus_msgs_processed: u64 = 0;
+        let mut timeouts_fired: u64 = 0;
+        let mut last_stats_log = Instant::now();
+        let mut last_commit_slot = self.last_committed_slot;
+        let mut last_commit_check = Instant::now();
+
         loop {
+            // Check for commit stalls
+            if last_commit_check.elapsed().as_secs() >= 5 {
+                if self.last_committed_slot == last_commit_slot {
+                    warn!("CORE: No commits for {} seconds! Last committed slot: {}, Open slots: {}, Active QC makers: {}, Active TC makers: {}", 
+                          last_commit_check.elapsed().as_secs(), 
+                          self.last_committed_slot,
+                          self.high_proposals.len(),
+                          self.qc_makers.len(),
+                          self.tc_makers.len());
+                    
+                    // Log current state of consensus instances
+                    if !self.high_proposals.is_empty() {
+                        warn!("CORE: Pending high proposals: {:?}", self.high_proposals.keys().collect::<Vec<_>>());
+                    }
+                    if !self.prepare_tickets.is_empty() {
+                        warn!("CORE: Prepare tickets queue: {} items", self.prepare_tickets.len());
+                    }
+                } else {
+                    debug!("CORE: Commits progressing - committed {} slots in last {} seconds", 
+                           self.last_committed_slot - last_commit_slot, 
+                           last_commit_check.elapsed().as_secs());
+                }
+                last_commit_slot = self.last_committed_slot;
+                last_commit_check = Instant::now();
+            }
+
             let result = tokio::select! {
                 // We receive here messages from other primaries.
                 Some(message) = self.rx_primaries.recv() => {
-                    match message {
+                    let result = match message {
                         PrimaryMessage::Header(header, sync) => {
+                            headers_processed += 1;
                             match self.sanitize_header(&header) {
                                 Ok(()) => self.process_header(header, sync).await,
                                 error => error
                             }
-
                         },
                         PrimaryMessage::Vote(vote) => {
+                            votes_processed += 1;
                             match self.sanitize_vote(&vote) {
                                 Ok(()) => {
                                     self.process_vote(vote, false).await
@@ -2154,25 +2191,38 @@ impl Core {
                             }
                         },
                         PrimaryMessage::Certificate(certificate) => {
+                            certificates_processed += 1;
                             match self.sanitize_certificate(&certificate) {
-                                Ok(()) => self.process_certificate(certificate).await, //self.receive_certificate(certificate).await,
+                                Ok(()) => self.process_certificate(certificate).await,
                                 error => {
                                     error
                                 }
                             }
                         },
-                        PrimaryMessage::Timeout(timeout) => self.handle_timeout(&timeout).await,
+                        PrimaryMessage::Timeout(timeout) => {
+                            timeouts_fired += 1;
+                            self.handle_timeout(&timeout).await
+                        },
                         PrimaryMessage::TC(tc) => self.handle_tc(&tc).await,
 
                         // We receive a forwarded prepare or commit message from another replica
-                        PrimaryMessage::ConsensusMessage(consensus_message) => self.process_forwarded_message(consensus_message).await,
+                        PrimaryMessage::ConsensusMessage(consensus_message) => {
+                            consensus_msgs_processed += 1;
+                            self.process_forwarded_message(consensus_message).await
+                        },
                           
-                    
                         // External Consensus implementation: Receive Consensus Requests (Prep/Confirm/Commit) or Votes (Prep-Vote/Confirm-Ack)
-                        PrimaryMessage::ConsensusRequest(consensus_req) => self.process_consensus_request(consensus_req).await,
-                        PrimaryMessage::ConsensusVote(consensus_vote) => self.process_consensus_vote(consensus_vote, false).await,
+                        PrimaryMessage::ConsensusRequest(consensus_req) => {
+                            consensus_msgs_processed += 1;
+                            self.process_consensus_request(consensus_req).await
+                        },
+                        PrimaryMessage::ConsensusVote(consensus_vote) => {
+                            consensus_msgs_processed += 1;
+                            self.process_consensus_vote(consensus_vote, false).await
+                        },
                         _ => panic!("Unexpected core message")
-                    }
+                    };
+                    result
                 },
 
                 // We also receive here our new headers created by the `Proposer`.
@@ -2263,6 +2313,36 @@ impl Core {
                 self.cancel_handlers.retain(|k, _| k >= &gc_round);
                 self.gc_round = gc_round;
                 debug!("GC round moved to {}", self.gc_round);
+            }
+            
+            // Log aggregate stats every 10 seconds
+            if last_stats_log.elapsed().as_secs() >= 10 {
+                let elapsed = last_stats_log.elapsed().as_secs_f64();
+                let hdr_rate = headers_processed as f64 / elapsed;
+                let vote_rate = votes_processed as f64 / elapsed;
+                let cert_rate = certificates_processed as f64 / elapsed;
+                let consensus_rate = consensus_msgs_processed as f64 / elapsed;
+                
+                info!("CORE: Processed {} hdrs ({:.1}/s), {} votes ({:.1}/s), {} certs ({:.1}/s), {} consensus msgs ({:.1}/s), {} timeouts in last {:.1}s", 
+                      headers_processed, hdr_rate,
+                      votes_processed, vote_rate,
+                      certificates_processed, cert_rate,
+                      consensus_msgs_processed, consensus_rate,
+                      timeouts_fired,
+                      elapsed);
+                info!("CORE: Last committed slot: {}, Active instances: {}, QC makers: {}, TC makers: {}, Prepare tickets: {}", 
+                      self.last_committed_slot,
+                      self.high_proposals.len(),
+                      self.qc_makers.len(),
+                      self.tc_makers.len(),
+                      self.prepare_tickets.len());
+                
+                headers_processed = 0;
+                votes_processed = 0;
+                certificates_processed = 0;
+                consensus_msgs_processed = 0;
+                timeouts_fired = 0;
+                last_stats_log = Instant::now();
             }
         }
     }
