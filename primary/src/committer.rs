@@ -15,7 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::metrics::{PRIMARY_COMMITS_TOTAL, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, record_flush_interval_commit};
+use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, record_flush_interval_commit};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -135,7 +135,7 @@ impl Committer {
                 }
 
                 while state.log.contains_key(&(state.last_executed_slot + 1)) {
-                    let start_time = std::time::Instant::now();
+                    let slot_start_time = std::time::Instant::now();
                     let current_commit_message = state.log.get(&(state.last_executed_slot + 1)).unwrap();
                     debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
                     match current_commit_message {
@@ -198,7 +198,13 @@ impl Committer {
                                 }
                             }
                             
-                            let slot_elapsed = start_time.elapsed();
+                            let slot_elapsed = slot_start_time.elapsed();
+                            let slot_elapsed_ms = slot_elapsed.as_millis() as f64;
+                            
+                            // Record slot execution metrics
+                            PRIMARY_SLOT_EXECUTION_LATENCY.observe(slot_elapsed_ms);
+                            PRIMARY_SLOTS_EXECUTED_TOTAL.inc();
+                            
                             if slot_elapsed.as_millis() > 50 {
                                 warn!("COMMITTER: Slot {} took {}ms to commit {} headers ({} proposals)", 
                                       state.last_executed_slot + 1, slot_elapsed.as_millis(), 
@@ -249,6 +255,9 @@ impl Committer {
                 let slots_committed = state.last_executed_slot.saturating_sub(last_executed_slot);
                 let slot_rate = slots_committed as f64 / elapsed;
                 let pending_slots = state.log.len();
+                
+                // Update pending slots gauge for Prometheus
+                PRIMARY_PENDING_SLOTS.set(pending_slots as i64);
                 
                 info!("COMMITTER: Received {} commit msgs ({:.1}/s), executed {} slots ({:.1} slot/s), {} pending in last {:.1}s", 
                       commits_received, commit_msgs_rate, slots_committed, slot_rate, pending_slots, elapsed);

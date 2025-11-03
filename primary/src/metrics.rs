@@ -1,7 +1,7 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    register_gauge, register_histogram_vec, register_int_counter, register_int_counter_vec,
-    Gauge, HistogramVec, IntCounter, IntCounterVec
+    register_gauge, register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+    Gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -70,6 +70,28 @@ lazy_static! {
             "Total number of headers committed by this primary"
         )
         .expect("failed to register primary_commits_total");
+
+    pub static ref PRIMARY_SLOTS_EXECUTED_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_slots_executed_total",
+            "Total number of consensus slots executed by the committer"
+        )
+        .expect("failed to register primary_slots_executed_total");
+
+    pub static ref PRIMARY_SLOT_EXECUTION_LATENCY: Histogram =
+        register_histogram!(
+            "primary_slot_execution_latency_ms",
+            "Time taken to execute a single consensus slot (milliseconds)",
+            vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0]
+        )
+        .expect("failed to register primary_slot_execution_latency_ms");
+
+    pub static ref PRIMARY_PENDING_SLOTS: IntGauge =
+        register_int_gauge!(
+            "primary_pending_slots",
+            "Number of consensus slots waiting to be executed by the committer"
+        )
+        .expect("failed to register primary_pending_slots");
 
     pub static ref PRIMARY_TIMEOUTS_TOTAL: IntCounter =
         register_int_counter!(
