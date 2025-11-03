@@ -172,16 +172,15 @@ impl BatchMaker {
 
             for id in tx_ids {
                 // NOTE: This log entry is used to compute performance.
-                info!(
-                    "Batch {:?} contains sample tx {}",
-                    digest,
-                    u64::from_be_bytes(id)
-                );
-            }
-
-            // NOTE: This log entry is used to compute performance.
-            info!("Batch {:?} contains {} B", digest, size);
+            info!(
+                "Batch {:?} contains sample tx {}",
+                digest,
+                u64::from_be_bytes(id)
+            );
         }
+
+        // NOTE: Removed individual batch size logging - now using aggregate stats
+    }
 
         // Broadcast the batch through the network.
 

@@ -1618,13 +1618,27 @@ impl Core {
 
                 // Only send to committer if proposals and all ancestors are stored locally,
                 // otherwise sync will be triggered, and this commit message will be reprocessed
-                if !self.synchronizer.get_proposals(&commit_message, &header).await.unwrap().is_empty() {
+                let proposals_ready = self.synchronizer.get_proposals(&commit_message, &header).await.unwrap();
+                if !proposals_ready.is_empty() {
                     //println!("Sent to committer");
-                    debug!("sending to committer");
-                    self.tx_committer
-                        .send(commit_message)
-                        .await
-                        .expect("Failed to send headers");
+                    debug!("sending to committer for slot {}", sl);
+                    
+                    // Try send first to detect backpressure
+                    match self.tx_committer.try_send(commit_message.clone()) {
+                        Ok(_) => {},
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            warn!("CORE: tx_committer channel FULL for slot {}! Committer may be overloaded", sl);
+                            // Fallback to blocking send
+                            if let Err(e) = self.tx_committer.send(commit_message).await {
+                                error!("CORE: CRITICAL - Failed to send commit for slot {}: {}", sl, e);
+                            }
+                        },
+                        Err(e) => {
+                            error!("CORE: CRITICAL - tx_committer channel closed for slot {}: {}", sl, e);
+                        }
+                    }
+                } else {
+                    debug!("CORE: Commit for slot {} blocked - waiting for proposals to sync", sl);
                 }
 
                 //Try waking any prepares that are waiting for a QC ticket

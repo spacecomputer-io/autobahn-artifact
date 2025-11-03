@@ -9,7 +9,7 @@ use crate::{Certificate, Header, Height};
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::borrow::BorrowMut;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
@@ -125,12 +125,24 @@ impl Committer {
 
                 // Store the commit message if all proposals are ready to be processed
                 state.log.insert(slot, commit_message);
+                let pending_slots = state.log.len();
+                
+                // Warn if too many slots are pending
+                if pending_slots > 100 {
+                    warn!("COMMITTER: {} slots pending execution! Last executed: {}, oldest pending: {:?}", 
+                          pending_slots, state.last_executed_slot, 
+                          state.log.keys().min());
+                }
 
                 while state.log.contains_key(&(state.last_executed_slot + 1)) {
+                    let start_time = std::time::Instant::now();
                     let current_commit_message = state.log.get(&(state.last_executed_slot + 1)).unwrap();
                     debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
                     match current_commit_message {
                         ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
+                            let sync_start = std::time::Instant::now();
+                            let mut total_headers_committed = 0;
+                            
                             for (pk, proposal) in proposals {
                                 let stop_height = *state.last_executed_heights.get(pk).unwrap();
                                 // Don't execute proposals which are too old
@@ -139,9 +151,16 @@ impl Committer {
                                     continue;
                                 }
 
+                                let get_headers_start = std::time::Instant::now();
                                 let headers = self.synchronizer.get_all_headers_for_proposal(proposal.clone(), stop_height)
                                     .await
                                     .expect("should have ancestors by now");
+                                let sync_elapsed = get_headers_start.elapsed();
+                                
+                                if sync_elapsed.as_millis() > 10 {
+                                    warn!("COMMITTER: Synchronizer took {}ms to get {} headers for proposal at height {}", 
+                                          sync_elapsed.as_millis(), headers.len(), proposal.height);
+                                }
 
                                 // Update last executed height for the lane
                                 if proposal.height > stop_height {
@@ -150,6 +169,7 @@ impl Committer {
 
                                 // Commit all of the headers
                                 for header in headers {
+                                    total_headers_committed += 1;
                                     info!("Committed {}", header);
                                     #[cfg(feature = "benchmark")]
                                     for digest in header.payload.keys() {
@@ -177,6 +197,14 @@ impl Committer {
                                     debug!("Finish upcall");
                                 }
                             }
+                            
+                            let slot_elapsed = start_time.elapsed();
+                            if slot_elapsed.as_millis() > 50 {
+                                warn!("COMMITTER: Slot {} took {}ms to commit {} headers ({} proposals)", 
+                                      state.last_executed_slot + 1, slot_elapsed.as_millis(), 
+                                      total_headers_committed, proposals.len());
+                            }
+                            
                             state.last_executed_slot += 1;
                         },
                         _ => {}
@@ -191,6 +219,11 @@ impl Committer {
     async fn run(&mut self) {
         // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
+        
+        // Stats tracking
+        let mut commits_received: u64 = 0;
+        let mut last_stats_log = std::time::Instant::now();
+        let mut last_executed_slot = 0u64;
 
         loop {
             tokio::select! {
@@ -202,10 +235,32 @@ impl Committer {
                     );*/
                 },
                 Some(commit_message) = self.rx_commit_message.recv() => {
+                    commits_received += 1;
                     self.process_commit_message(state.borrow_mut(), commit_message).await;
                 },
                 Some(_) = self.rx_deliver.recv() => {}
 
+            }
+            
+            // Log aggregate stats every 5 seconds
+            if last_stats_log.elapsed().as_secs() >= 5 {
+                let elapsed = last_stats_log.elapsed().as_secs_f64();
+                let commit_msgs_rate = commits_received as f64 / elapsed;
+                let slots_committed = state.last_executed_slot.saturating_sub(last_executed_slot);
+                let slot_rate = slots_committed as f64 / elapsed;
+                let pending_slots = state.log.len();
+                
+                info!("COMMITTER: Received {} commit msgs ({:.1}/s), executed {} slots ({:.1} slot/s), {} pending in last {:.1}s", 
+                      commits_received, commit_msgs_rate, slots_committed, slot_rate, pending_slots, elapsed);
+                
+                if pending_slots > 50 {
+                    warn!("COMMITTER: High backlog - {} pending slots! Oldest: {:?}, Last executed: {}", 
+                          pending_slots, state.log.keys().min(), state.last_executed_slot);
+                }
+                
+                commits_received = 0;
+                last_executed_slot = state.last_executed_slot;
+                last_stats_log = std::time::Instant::now();
             }
         }
     }

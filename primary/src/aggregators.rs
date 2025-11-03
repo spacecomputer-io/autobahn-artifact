@@ -90,6 +90,7 @@ pub struct QCMaker {
     qc_dig: Digest, 
     first: bool,          //Indicate when SlowQC is first ready -> I.e. only start ONE timer.
     completed_fast: bool, //Indicate whether or not we succeeded on Fast Path. This stops timer that loopbacks from re-submitting QC
+    first_vote_time: Option<std::time::Instant>, // Track when first vote arrives
 }
 
 impl QCMaker {
@@ -102,6 +103,7 @@ impl QCMaker {
             qc_dig: Digest::default(),
             first: true, 
             completed_fast: false,
+            first_vote_time: None,
         }
     }
 
@@ -115,6 +117,11 @@ impl QCMaker {
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
         //println!("after ensure");
 
+        // Track when first vote arrives
+        if self.first_vote_time.is_none() {
+            self.first_vote_time = Some(std::time::Instant::now());
+        }
+
         self.votes.push((author, vote.1));
         self.weight += committee.stake(&author);
         //println!("QC weight is {:?}", self.weight);
@@ -124,6 +131,15 @@ impl QCMaker {
         }
         //else Slow path:
         if self.weight >= committee.quorum_threshold() {
+            // Log QC formation time if it took more than 100ms
+            if let Some(start) = self.first_vote_time {
+                let elapsed = start.elapsed();
+                if elapsed.as_millis() > 100 {
+                    log::warn!("QCMaker: Slow QC formation took {}ms ({} votes)", 
+                              elapsed.as_millis(), self.votes.len());
+                }
+            }
+            
             // Ensure QC is only made once.
             self.weight = 0; 
             return Ok((true, Some(QC { id: vote.0, votes: self.votes.clone() })))
@@ -134,6 +150,15 @@ impl QCMaker {
 
     pub fn check_fast_qc(&mut self, vote_dig: Digest, committee: &Committee) -> DagResult<(bool, Option<QC>)> {
         if self.weight >= committee.fast_threshold() {
+            // Log fast QC formation time if it took more than 50ms
+            if let Some(start) = self.first_vote_time {
+                let elapsed = start.elapsed();
+                if elapsed.as_millis() > 50 {
+                    log::warn!("QCMaker: Slow FAST QC formation took {}ms ({} votes)", 
+                              elapsed.as_millis(), self.votes.len());
+                }
+            }
+            
             // Ensure QC is only made once.
             self.weight = 0; 
             self.completed_fast = true;
