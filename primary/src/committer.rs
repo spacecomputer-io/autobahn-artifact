@@ -243,6 +243,9 @@ impl Committer {
                 Some(commit_message) = self.rx_commit_message.recv() => {
                     commits_received += 1;
                     self.process_commit_message(state.borrow_mut(), commit_message).await;
+                    
+                    // Update pending slots gauge immediately after processing
+                    PRIMARY_PENDING_SLOTS.set(state.log.len() as i64);
                 },
                 Some(_) = self.rx_deliver.recv() => {}
 
@@ -256,8 +259,8 @@ impl Committer {
                 let slot_rate = slots_committed as f64 / elapsed;
                 let pending_slots = state.log.len();
                 
-                // Update pending slots gauge for Prometheus
-                PRIMARY_PENDING_SLOTS.set(pending_slots as i64);
+                // Note: PRIMARY_PENDING_SLOTS gauge is updated after each commit message processing,
+                // not here, to ensure Prometheus always sees current values
                 
                 info!("COMMITTER: Received {} commit msgs ({:.1}/s), executed {} slots ({:.1} slot/s), {} pending in last {:.1}s", 
                       commits_received, commit_msgs_rate, slots_committed, slot_rate, pending_slots, elapsed);
