@@ -212,6 +212,9 @@ impl Committer {
                             }
                             
                             state.last_executed_slot += 1;
+                            
+                            // Remove the executed slot from the pending queue
+                            state.log.remove(&state.last_executed_slot);
                         },
                         _ => {}
                     }
