@@ -127,6 +127,9 @@ impl Committer {
                 state.log.insert(slot, commit_message);
                 let pending_slots = state.log.len();
                 
+                // Update Prometheus gauge BEFORE executing slots (to capture peak backlog)
+                PRIMARY_PENDING_SLOTS.set(pending_slots as i64);
+                
                 // Warn if too many slots are pending
                 if pending_slots > 100 {
                     warn!("COMMITTER: {} slots pending execution! Last executed: {}, oldest pending: {:?}", 
@@ -247,8 +250,7 @@ impl Committer {
                     commits_received += 1;
                     self.process_commit_message(state.borrow_mut(), commit_message).await;
                     
-                    // Update pending slots gauge immediately after processing
-                    PRIMARY_PENDING_SLOTS.set(state.log.len() as i64);
+                    // Note: Gauge is updated inside process_commit_message before slot execution
                 },
                 Some(_) = self.rx_deliver.recv() => {}
 
