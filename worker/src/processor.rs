@@ -4,7 +4,7 @@ use config::WorkerId;
 use crypto::Digest;
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
-use log::{info, debug, warn, error};
+use log::{info, warn, error};
 use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;
 use store::Store;
@@ -38,14 +38,25 @@ impl Processor {
             let mut batch_count: u64 = 0;
             let mut total_bytes: u64 = 0;
             let mut last_log_time = std::time::Instant::now();
+            let mut total_store_write_time_ms: u64 = 0;
+            let mut slow_store_writes: u64 = 0;
             
             while let Some((batch, first_tx_at_ms)) = rx_batch.recv().await {
                 // Hash the batch.
                 let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
                 let batch_size_bytes = batch.len() as u64;
 
-                // Store the batch.
+                // Store the batch with latency measurement.
+                let store_start = std::time::Instant::now();
                 store.write(digest.to_vec(), batch).await;
+                let store_elapsed_ms = store_start.elapsed().as_millis() as u64;
+                
+                total_store_write_time_ms += store_elapsed_ms;
+                if store_elapsed_ms > 10 {
+                    slow_store_writes += 1;
+                    warn!("WORKER[{}]: Slow store write took {}ms for {} bytes", 
+                          id, store_elapsed_ms, batch_size_bytes);
+                }
 
                 // Deliver the batch's digest.
                 let digest_copy = digest.clone();
@@ -91,6 +102,29 @@ impl Processor {
                     let throughput_mb = (total_bytes as f64 / last_log_time.elapsed().as_secs_f64()) / 1_048_576.0;
                     info!("WORKER[{}]: Processed {} batches ({:.2} batches/s, {:.2} MB/s) in last {:.1}s", 
                           id, batch_count, rate, throughput_mb, last_log_time.elapsed().as_secs_f64());
+                    
+                    // Channel capacity monitoring (only RX channels - Sender doesn't expose len())
+                    let rx_remaining = rx_batch.capacity() - rx_batch.len();
+                    let rx_usage_pct = (rx_batch.len() as f64 / rx_batch.capacity() as f64) * 100.0;
+                    
+                    info!("WORKER[{}] CHANNELS: rx_batch {}/{} slots ({:.1}% full, {} remaining)",
+                          id, rx_batch.len(), rx_batch.capacity(), rx_usage_pct, rx_remaining);
+                    
+                    // Warn if channel getting full
+                    if rx_usage_pct > 80.0 {
+                        warn!("WORKER[{}]: rx_batch channel {:.1}% full ({}/{}) - BatchMaker may be blocked!",
+                              id, rx_usage_pct, rx_batch.len(), rx_batch.capacity());
+                    }
+                    
+                    // Store write performance
+                    if batch_count > 0 {
+                        let avg_store_ms = total_store_write_time_ms as f64 / batch_count as f64;
+                        info!("WORKER[{}] STORAGE: {} writes, avg {:.2}ms, {} slow (>10ms)",
+                              id, batch_count, avg_store_ms, slow_store_writes);
+                        total_store_write_time_ms = 0;
+                        slow_store_writes = 0;
+                    }
+                    
                     batch_count = 0;
                     total_bytes = 0;
                     last_log_time = std::time::Instant::now();

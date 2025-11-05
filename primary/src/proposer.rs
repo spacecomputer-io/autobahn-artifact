@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::collections::{HashMap, BTreeMap};
+use std::collections::HashMap;
 
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header, ConsensusMessage};
@@ -294,6 +294,27 @@ impl Proposer {
                 info!("PROPOSER: Proposed {} headers ({:.2} hdr/s) with {} batches ({:.1} batch/s) in last {:.1}s - Current height: {}", 
                       headers_proposed, header_rate, batches_included, batch_rate, 
                       last_stats_log.elapsed().as_secs_f64(), self.height);
+                
+                // Channel capacity monitoring (only RX channels - Sender doesn't expose len())
+                let rx_workers_remaining = self.rx_workers.capacity() - self.rx_workers.len();
+                let rx_workers_pct = (self.rx_workers.len() as f64 / self.rx_workers.capacity() as f64) * 100.0;
+                let rx_core_remaining = self.rx_core.capacity() - self.rx_core.len();
+                let rx_core_pct = (self.rx_core.len() as f64 / self.rx_core.capacity() as f64) * 100.0;
+                
+                info!("PROPOSER CHANNELS: rx_workers {}/{} ({:.1}% full, {} remaining), rx_core {}/{} ({:.1}% full, {} remaining)",
+                      self.rx_workers.len(), self.rx_workers.capacity(), rx_workers_pct, rx_workers_remaining,
+                      self.rx_core.len(), self.rx_core.capacity(), rx_core_pct, rx_core_remaining);
+                
+                // Warn if channels getting full
+                if rx_workers_pct > 80.0 {
+                    warn!("PROPOSER: rx_workers channel {:.1}% full - workers sending batches faster than we can propose!",
+                          rx_workers_pct);
+                }
+                if rx_core_pct > 80.0 {
+                    warn!("PROPOSER: rx_core channel {:.1}% full - certificates backing up!",
+                          rx_core_pct);
+                }
+                
                 headers_proposed = 0;
                 batches_included = 0;
                 last_stats_log = Instant::now();

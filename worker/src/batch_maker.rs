@@ -9,7 +9,7 @@ use crypto::Digest;
 use crypto::PublicKey;
 #[cfg(feature = "benchmark")]
 use ed25519_dalek::{Digest as _, Sha512};
-use log::{debug, info};
+use log::{debug, info, warn};
 use network::{ReliableSender, SimpleSender};
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
@@ -51,6 +51,10 @@ pub struct BatchMaker {
     network: SimpleSender,
     /// Timestamp in ms of the first tx received for the currently building batch (if any).
     first_tx_submit_ms: Option<u64>,
+    /// Performance tracking for network broadcasts
+    total_broadcast_time_ms: u64,
+    broadcast_count: u64,
+    slow_broadcasts: u64,
 }
 
 impl BatchMaker {
@@ -74,6 +78,9 @@ impl BatchMaker {
                 current_batch_size: 0,
                 network: SimpleSender::new(),
                 first_tx_submit_ms: None,
+                total_broadcast_time_ms: 0,
+                broadcast_count: 0,
+                slow_broadcasts: 0,
             }
             .run()
             .await;
@@ -129,8 +136,33 @@ impl BatchMaker {
             if last_stats_log.elapsed().as_secs() >= 5 {
                 let tx_rate = tx_count as f64 / last_stats_log.elapsed().as_secs_f64();
                 let batch_rate = batch_sealed_count as f64 / last_stats_log.elapsed().as_secs_f64();
+                
+                // Channel capacity monitoring
+                let rx_remaining = self.rx_transaction.capacity() - self.rx_transaction.len();
+                let rx_usage_pct = (self.rx_transaction.len() as f64 / self.rx_transaction.capacity() as f64) * 100.0;
+                
                 info!("BatchMaker: Received {} txs ({:.1} tx/s), sealed {} batches ({:.2} batch/s) in last {:.1}s", 
                       tx_count, tx_rate, batch_sealed_count, batch_rate, last_stats_log.elapsed().as_secs_f64());
+                
+                info!("BatchMaker CHANNEL: rx_transaction {}/{} slots used ({:.1}% full, {} remaining)",
+                      self.rx_transaction.len(), self.rx_transaction.capacity(), rx_usage_pct, rx_remaining);
+                
+                // Warn if channel getting full
+                if rx_usage_pct > 80.0 {
+                    warn!("BatchMaker: rx_transaction channel {:.1}% full ({}/{}) - possible backpressure from network!",
+                          rx_usage_pct, self.rx_transaction.len(), self.rx_transaction.capacity());
+                }
+                
+                // Network broadcast performance
+                if self.broadcast_count > 0 {
+                    let avg_broadcast_ms = self.total_broadcast_time_ms as f64 / self.broadcast_count as f64;
+                    info!("BatchMaker NETWORK: {} broadcasts, avg {:.2}ms, {} slow (>20ms)",
+                          self.broadcast_count, avg_broadcast_ms, self.slow_broadcasts);
+                    self.total_broadcast_time_ms = 0;
+                    self.broadcast_count = 0;
+                    self.slow_broadcasts = 0;
+                }
+                
                 tx_count = 0;
                 batch_sealed_count = 0;
                 last_stats_log = Instant::now();
@@ -188,7 +220,20 @@ impl BatchMaker {
         //Best-effort broadcast only. Any failure is correlated with the primary operating this node (running on same machine)
         let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
         let bytes = Bytes::from(serialized.clone());
-        self.network.broadcast(addresses, bytes).await; 
+        
+        // Measure broadcast latency
+        let broadcast_start = Instant::now();
+        self.network.broadcast(addresses, bytes).await;
+        let broadcast_elapsed_ms = broadcast_start.elapsed().as_millis() as u64;
+        
+        // Track broadcast performance
+        self.broadcast_count += 1;
+        self.total_broadcast_time_ms += broadcast_elapsed_ms;
+        if broadcast_elapsed_ms > 20 {
+            self.slow_broadcasts += 1;
+            log::warn!("BatchMaker: Slow broadcast took {}ms to {} workers", 
+                      broadcast_elapsed_ms, self.workers_addresses.len());
+        } 
 
         let submit_ms = self.first_tx_submit_ms.take();
         self.tx_batch.send((serialized, submit_ms)).await.expect("Failed to deliver batch");
