@@ -826,7 +826,15 @@ impl Core {
     }
 
      //TODO: Then work on Process Vote //TODO: Add a function: SendConsensus
-    async fn process_consensus_vote(&mut self, vote: ConsensusVote, is_loopback: bool) -> DagResult<()> {
+    async fn process_consensus_vote(&mut self, vote: ConsensusVote, is_loopback: bool, msg_receive_time: std::time::Instant) -> DagResult<()> {
+
+        let process_start = std::time::Instant::now();
+        let from_receive_to_process = process_start.duration_since(msg_receive_time).as_millis();
+        
+        if from_receive_to_process > 10 && !is_loopback {
+            warn!("PRIMARY: Vote for slot {} took {}ms from message receipt to processing start", 
+                   vote.slot, from_receive_to_process);
+        }
 
         debug!("Receive consensus vote for dig {}", &vote.digest);
 
@@ -838,7 +846,14 @@ impl Core {
 
         if !is_loopback && vote.author != self.name {
             //Verify signature. Could optimize performance by only verifying after forming a batch, and use parallel batch_verification
+            let verify_start = std::time::Instant::now();
             vote.sig.verify(&vote.digest, &vote.author)?;
+            let verify_elapsed = verify_start.elapsed().as_millis();
+            
+            if verify_elapsed > 5 {
+                warn!("PRIMARY: Slow signature verification took {}ms for slot {}", 
+                       verify_elapsed, vote.slot);
+            }
         }
 
         let current_instance = opt_curr_instance.unwrap();
@@ -852,11 +867,11 @@ impl Core {
             ConsensusMessage::Prepare {slot: _, view: _, tc: _, qc_ticket: _, proposals: _, } => self.use_fast_path,  //Only PrepareQC should try to compute a FastQC
             _ => false,
         };
- 
+
         
- 
+
         // Add vote to qc maker, if a QC forms then create a new consensus instance
-             
+        let append_start = std::time::Instant::now();     
         //If qc_ready, but qc_opt = None => This is first Slow QC;
         //If qc_ready and qc_opt => This is FastQC or Consumption of Loopback to fetch SlowQC
         let (qc_ready, qc_opt) = match is_loopback {
@@ -866,8 +881,23 @@ impl Core {
                 qc_maker.get_qc()?
             }
         };
+        let append_elapsed = append_start.elapsed().as_millis();
+        
+        if append_elapsed > 10 && !is_loopback {
+            warn!("PRIMARY: Slow QC maker append took {}ms for slot {}", 
+                   append_elapsed, vote.slot);
+        }
 
         debug!("qc maker weight {:?}", qc_maker.votes.len());
+        
+        // Log total vote processing time
+        let total_process_time = process_start.elapsed().as_millis();
+        if total_process_time > 20 && !is_loopback {
+            warn!("PRIMARY: Total vote processing took {}ms for slot {} (receive-to-process: {}ms, verify: {}ms if applicable, append: {}ms)", 
+                   total_process_time, vote.slot, from_receive_to_process, 
+                   if vote.author != self.name { "measured" } else { "skipped" }, 
+                   append_elapsed);
+        }
 
         if qc_ready {
             if qc_opt.is_none() && self.use_fast_path {
@@ -1452,7 +1482,8 @@ impl Core {
 
         if author == self.name {
             debug!("Process own consensus vote");
-            self.process_consensus_vote(vote, false).await.expect("Failed to process our own vote"); //TODO: Don't need to sign...
+            let local_time = std::time::Instant::now();
+            self.process_consensus_vote(vote, false, local_time).await.expect("Failed to process our own vote"); //TODO: Don't need to sign...
         } 
         else {
             debug!("Send consensus vote to replica {}", author);
@@ -2262,8 +2293,10 @@ impl Core {
                             self.process_consensus_request(consensus_req).await
                         },
                         PrimaryMessage::ConsensusVote(consensus_vote) => {
+                            let msg_receive_time = std::time::Instant::now();
                             consensus_msgs_processed += 1;
-                            self.process_consensus_vote(consensus_vote, false).await
+                            let result = self.process_consensus_vote(consensus_vote, false, msg_receive_time).await;
+                            result
                         },
                         _ => panic!("Unexpected core message")
                     };
@@ -2299,7 +2332,10 @@ impl Core {
                 Some(vote) = self.car_timer_futures.next() => self.process_vote(vote, true).await,
 
                 //Fast path loopback for external consensus
-                Some(vote) = self.fast_timer_futures.next() => self.process_consensus_vote(vote, true).await,
+                Some(vote) = self.fast_timer_futures.next() => {
+                    let loopback_time = std::time::Instant::now();
+                    self.process_consensus_vote(vote, true, loopback_time).await
+                },
 
                 Some((slot, view)) = self.async_timer_futures.next() => {
                     self.during_simulated_asynchrony = !self.during_simulated_asynchrony; 
