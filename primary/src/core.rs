@@ -385,7 +385,17 @@ impl Core {
 
         // Store the header since we have the parents (recursively).
         let bytes = bincode::serialize(&header).expect("Failed to serialize header");
+        
+        // Time the storage write
+        let store_start = std::time::Instant::now();
         self.store.write(header.digest().to_vec(), bytes).await;
+        let store_elapsed = store_start.elapsed().as_millis();
+        
+        // Log if slow
+        if store_elapsed > 10 {
+            warn!("PRIMARY: Slow header store write took {}ms for height {}", 
+                   store_elapsed, header.height());
+        }
 
         // If the header received is at a greater height then add it to our local tips and proposals
         if self.use_optimistic_tips && header.height() > self.current_proposal_tips.get(&header.origin()).unwrap().height {
@@ -1005,7 +1015,17 @@ impl Core {
 
         // Store the certificate.
         let bytes = bincode::serialize(&certificate).expect("Failed to serialize certificate");
+        
+        // Time the storage write
+        let store_start = std::time::Instant::now();
         self.store.write(certificate.digest().to_vec(), bytes).await;
+        let store_elapsed = store_start.elapsed().as_millis();
+        
+        // Log if slow
+        if store_elapsed > 10 {
+            warn!("PRIMARY: Slow certificate store write took {}ms for height {}", 
+                   store_elapsed, certificate.height());
+        }
 
         //println!("Stored the certificate: {:?}", certificate.digest());
 
@@ -1442,9 +1462,20 @@ impl Core {
                     .primary(&author)
                     .expect("Author of valid header is not in the committee")
                     .primary_to_primary;
-                let bytes = bincode::serialize(&PrimaryMessage::ConsensusVote(vote))
+                let bytes = bincode::serialize(&PrimaryMessage::ConsensusVote(vote.clone()))
                     .expect("Failed to serialize our own vote");
+                
+                // Time the network send
+                let send_start = std::time::Instant::now();
                 let handler = self.network.send(address, Bytes::from(bytes)).await;
+                let send_elapsed = send_start.elapsed().as_millis();
+                
+                // Log if slow
+                if send_elapsed > 50 {
+                    warn!("PRIMARY: Slow vote send to {} took {}ms for slot {}", 
+                           address, send_elapsed, vote.slot);
+                }
+                
                 self.consensus_cancel_handlers
                     .entry(slot) 
                     .or_insert_with(Vec::new)

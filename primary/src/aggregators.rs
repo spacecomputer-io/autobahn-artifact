@@ -91,6 +91,7 @@ pub struct QCMaker {
     first: bool,          //Indicate when SlowQC is first ready -> I.e. only start ONE timer.
     completed_fast: bool, //Indicate whether or not we succeeded on Fast Path. This stops timer that loopbacks from re-submitting QC
     first_vote_time: Option<std::time::Instant>, // Track when first vote arrives
+    vote_arrival_times: Vec<(PublicKey, std::time::Instant)>, // Track when each vote arrives
 }
 
 impl QCMaker {
@@ -104,6 +105,7 @@ impl QCMaker {
             first: true, 
             completed_fast: false,
             first_vote_time: None,
+            vote_arrival_times: Vec::new(),
         }
     }
 
@@ -117,10 +119,15 @@ impl QCMaker {
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
         //println!("after ensure");
 
+        let now = std::time::Instant::now();
+        
         // Track when first vote arrives
         if self.first_vote_time.is_none() {
-            self.first_vote_time = Some(std::time::Instant::now());
+            self.first_vote_time = Some(now);
         }
+        
+        // Track each vote's arrival time
+        self.vote_arrival_times.push((author, now));
 
         self.votes.push((author, vote.1));
         self.weight += committee.stake(&author);
@@ -137,6 +144,13 @@ impl QCMaker {
                 if elapsed.as_millis() > 100 {
                     log::warn!("QCMaker: Slow QC formation took {}ms ({} votes)", 
                               elapsed.as_millis(), self.votes.len());
+                    
+                    // Log detailed vote arrival pattern
+                    log::warn!("QCMaker: Vote arrival times:");
+                    for (i, (voter, arrival_time)) in self.vote_arrival_times.iter().enumerate() {
+                        let delay = arrival_time.duration_since(start).as_millis();
+                        log::warn!("  Vote {} from {:?} arrived at +{}ms", i+1, voter, delay);
+                    }
                 }
             }
             
@@ -156,6 +170,13 @@ impl QCMaker {
                 if elapsed.as_millis() > 50 {
                     log::warn!("QCMaker: Slow FAST QC formation took {}ms ({} votes)", 
                               elapsed.as_millis(), self.votes.len());
+                    
+                    // Log detailed vote arrival pattern
+                    log::warn!("QCMaker: Fast path vote arrival times:");
+                    for (i, (voter, arrival_time)) in self.vote_arrival_times.iter().enumerate() {
+                        let delay = arrival_time.duration_since(start).as_millis();
+                        log::warn!("  Vote {} from {:?} arrived at +{}ms", i+1, voter, delay);
+                    }
                 }
             }
             
