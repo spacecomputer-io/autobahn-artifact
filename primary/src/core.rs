@@ -1174,11 +1174,13 @@ impl Core {
                     self.already_proposed_slots.insert(slot + 1);
                     //self.prepare_tickets.pop_front();
 
-                    //TODO: Start measuring consensus latency from here. Measure latency for a slots commit
-                    // #[cfg(feature = "benchmark")]
-                    // // NOTE: This log entry is used to compute performance.
-                    // info!("Started slot {}", slot + 1);
-                    // 
+                    // Start measuring slot propose-to-execute latency
+                    #[cfg(feature = "benchmark")]
+                    {
+                        use crate::metrics::record_slot_propose_time;
+                        record_slot_propose_time(slot + 1);
+                        info!("Started slot {}", slot + 1);
+                    }
 
                     if self.use_ride_share {
                         self.tx_info

@@ -15,7 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, record_flush_interval_commit};
+use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, PRIMARY_SLOT_HEADERS_BY_NODE, PRIMARY_SLOT_BYTES_BY_NODE, PRIMARY_SLOT_DIGESTS_BY_NODE, PRIMARY_ACTIVE_NODES_IN_SLOT, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, record_flush_interval_commit};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -145,6 +145,7 @@ impl Committer {
                         ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
                             let sync_start = std::time::Instant::now();
                             let mut total_headers_committed = 0;
+                            let mut active_nodes = HashSet::new();
                             
                             for (pk, proposal) in proposals {
                                 let stop_height = *state.last_executed_heights.get(pk).unwrap();
@@ -173,6 +174,12 @@ impl Committer {
                                 // Commit all of the headers
                                 for header in headers {
                                     total_headers_committed += 1;
+                                    
+                                    // Track per-node contribution
+                                    active_nodes.insert(header.author);
+                                    let author_str = format!("{}", header.author);
+                                    PRIMARY_SLOT_HEADERS_BY_NODE.with_label_values(&[&author_str]).inc();
+                                    
                                     info!("Committed {}", header);
                                     #[cfg(feature = "benchmark")]
                                     for digest in header.payload.keys() {
@@ -186,20 +193,29 @@ impl Committer {
                                     }
                                     PRIMARY_COMMITS_TOTAL.inc();
                                     observe_propose_to_commit_latency(&header.id);
+                                    
                                     // Observe batch ingress->commit for all digests in this committed header
                                     let mut total_bytes: u64 = 0;
+                                    let num_digests = header.payload.len();
                                     for (digest, _) in header.payload.iter() {
                                         observe_batch_ingress_to_commit_latency(digest);
                                         observe_tx_submit_to_commit_latency(digest);
                                         total_bytes = total_bytes.saturating_add(take_batch_size_bytes(digest));
                                     }
                                     
+                                    // Track per-node bytes and digests
+                                    PRIMARY_SLOT_BYTES_BY_NODE.with_label_values(&[&author_str]).inc_by(total_bytes);
+                                    PRIMARY_SLOT_DIGESTS_BY_NODE.with_label_values(&[&author_str]).inc_by(num_digests as u64);
+                                    
                                     // Record data for flush interval metrics
-                                    record_flush_interval_commit(header.payload.len(), total_bytes);
+                                    record_flush_interval_commit(num_digests, total_bytes);
                                     
                                     debug!("Finish upcall");
                                 }
                             }
+                            
+                            // Record how many unique nodes contributed to this slot
+                            PRIMARY_ACTIVE_NODES_IN_SLOT.set(active_nodes.len() as i64);
                             
                             let slot_elapsed = slot_start_time.elapsed();
                             let slot_elapsed_ms = slot_elapsed.as_millis() as f64;
@@ -207,6 +223,13 @@ impl Committer {
                             // Record slot execution metrics
                             PRIMARY_SLOT_EXECUTION_LATENCY.observe(slot_elapsed_ms);
                             PRIMARY_SLOTS_EXECUTED_TOTAL.inc();
+                            
+                            // Record end-to-end slot propose-to-execute latency
+                            #[cfg(feature = "benchmark")]
+                            {
+                                use crate::metrics::observe_slot_propose_to_execute_latency;
+                                observe_slot_propose_to_execute_latency(state.last_executed_slot + 1);
+                            }
                             
                             if slot_elapsed.as_millis() > 50 {
                                 warn!("COMMITTER: Slot {} took {}ms to commit {} headers ({} proposals)", 

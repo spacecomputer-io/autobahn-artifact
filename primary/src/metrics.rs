@@ -18,6 +18,7 @@ pub struct FlushIntervalData {
     pub propose_to_commit_latencies_ms: Vec<f64>,
     pub batch_ingress_to_commit_latencies_ms: Vec<f64>,
     pub tx_submit_to_commit_latencies_ms: Vec<f64>,
+    pub slot_propose_to_execute_latencies_ms: Vec<f64>,
 }
 
 impl FlushIntervalData {
@@ -30,6 +31,7 @@ impl FlushIntervalData {
             propose_to_commit_latencies_ms: Vec::new(),
             batch_ingress_to_commit_latencies_ms: Vec::new(),
             tx_submit_to_commit_latencies_ms: Vec::new(),
+            slot_propose_to_execute_latencies_ms: Vec::new(),
         }
     }
 
@@ -41,6 +43,7 @@ impl FlushIntervalData {
         self.propose_to_commit_latencies_ms.clear();
         self.batch_ingress_to_commit_latencies_ms.clear();
         self.tx_submit_to_commit_latencies_ms.clear();
+        self.slot_propose_to_execute_latencies_ms.clear();
     }
 
     pub fn calculate_avg_latency(latencies: &[f64]) -> f64 {
@@ -242,6 +245,65 @@ lazy_static! {
         ).expect("failed to register primary_throughput_tx_per_second");
 
     // ============================================================================
+    // LATENCY GAUGES - Flush Interval Averages
+    // ============================================================================
+
+    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_PROPOSE_TO_COMMIT_AVG_MS: Gauge =
+        register_gauge!(
+            "primary_flush_interval_latency_propose_to_commit_avg_ms",
+            "Average propose-to-commit latency in the last flush interval (milliseconds)"
+        ).expect("failed to register primary_flush_interval_latency_propose_to_commit_avg_ms");
+
+    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_BATCH_TO_COMMIT_AVG_MS: Gauge =
+        register_gauge!(
+            "primary_flush_interval_latency_batch_to_commit_avg_ms",
+            "Average batch-ingress-to-commit latency in the last flush interval (milliseconds)"
+        ).expect("failed to register primary_flush_interval_latency_batch_to_commit_avg_ms");
+
+    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_TX_TO_COMMIT_AVG_MS: Gauge =
+        register_gauge!(
+            "primary_flush_interval_latency_tx_to_commit_avg_ms",
+            "Average tx-submit-to-commit latency in the last flush interval (milliseconds)"
+        ).expect("failed to register primary_flush_interval_latency_tx_to_commit_avg_ms");
+
+    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_SLOT_PROPOSE_TO_EXECUTE_AVG_MS: Gauge =
+        register_gauge!(
+            "primary_flush_interval_latency_slot_propose_to_execute_avg_ms",
+            "Average slot-propose-to-execute latency in the last flush interval (milliseconds)"
+        ).expect("failed to register primary_flush_interval_latency_slot_propose_to_execute_avg_ms");
+
+    // ============================================================================
+    // PER-NODE SLOT CONTRIBUTION METRICS
+    // ============================================================================
+
+    pub static ref PRIMARY_SLOT_HEADERS_BY_NODE: IntCounterVec =
+        register_int_counter_vec!(
+            "primary_slot_headers_by_node",
+            "Total number of headers committed per node (by author)",
+            &["node"]
+        ).expect("failed to register primary_slot_headers_by_node");
+
+    pub static ref PRIMARY_SLOT_BYTES_BY_NODE: IntCounterVec =
+        register_int_counter_vec!(
+            "primary_slot_bytes_by_node",
+            "Total bytes committed per node (by author)",
+            &["node"]
+        ).expect("failed to register primary_slot_bytes_by_node");
+
+    pub static ref PRIMARY_SLOT_DIGESTS_BY_NODE: IntCounterVec =
+        register_int_counter_vec!(
+            "primary_slot_digests_by_node",
+            "Total digests/batches committed per node (by author)",
+            &["node"]
+        ).expect("failed to register primary_slot_digests_by_node");
+
+    pub static ref PRIMARY_ACTIVE_NODES_IN_SLOT: IntGauge =
+        register_int_gauge!(
+            "primary_active_nodes_in_slot",
+            "Number of nodes that contributed to the most recently executed slot"
+        ).expect("failed to register primary_active_nodes_in_slot");
+
+    // ============================================================================
     // Internal State for Tracking
     // ============================================================================
 
@@ -250,6 +312,7 @@ lazy_static! {
     static ref SUBMIT_MS_BY_BATCH: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
     static ref BATCH_SIZE_BYTES_BY_DIGEST: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
     static ref FLUSH_INTERVAL_DATA: Mutex<FlushIntervalData> = Mutex::new(FlushIntervalData::new());
+    static ref SLOT_PROPOSE_TIMES: Mutex<HashMap<u64, Instant>> = Mutex::new(HashMap::new());
 }
 
 // ============================================================================
@@ -308,6 +371,23 @@ pub fn observe_tx_submit_to_commit_latency(digest: &Digest) {
     }
 }
 
+pub fn record_slot_propose_time(slot: u64) {
+    let mut map = SLOT_PROPOSE_TIMES.lock().unwrap();
+    map.insert(slot, Instant::now());
+}
+
+pub fn observe_slot_propose_to_execute_latency(slot: u64) {
+    let mut map = SLOT_PROPOSE_TIMES.lock().unwrap();
+    if let Some(start) = map.remove(&slot) {
+        let latency_ms = start.elapsed().as_millis() as f64;
+        PRIMARY_LATENCY_MS.with_label_values(&["slot_propose_to_execute"]).observe(latency_ms);
+
+        // Also accumulate for flush interval
+        let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
+        flush_data.slot_propose_to_execute_latencies_ms.push(latency_ms);
+    }
+}
+
 // ============================================================================
 // Helper Functions - Batch Size Tracking
 // ============================================================================
@@ -352,6 +432,17 @@ pub fn flush_interval_metrics(interval_ms: u64) {
         PRIMARY_THROUGHPUT_BYTES_PER_SECOND.set(flush_data.byte_count as f64 / interval_sec);
         PRIMARY_THROUGHPUT_TX_PER_SECOND.set(flush_data.transaction_count as f64 / interval_sec);
     }
+
+    // Calculate and update average latencies
+    let avg_propose_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.propose_to_commit_latencies_ms);
+    let avg_batch_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.batch_ingress_to_commit_latencies_ms);
+    let avg_tx_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.tx_submit_to_commit_latencies_ms);
+    let avg_slot_latency = FlushIntervalData::calculate_avg_latency(&flush_data.slot_propose_to_execute_latencies_ms);
+
+    PRIMARY_FLUSH_INTERVAL_LATENCY_PROPOSE_TO_COMMIT_AVG_MS.set(avg_propose_to_commit);
+    PRIMARY_FLUSH_INTERVAL_LATENCY_BATCH_TO_COMMIT_AVG_MS.set(avg_batch_to_commit);
+    PRIMARY_FLUSH_INTERVAL_LATENCY_TX_TO_COMMIT_AVG_MS.set(avg_tx_to_commit);
+    PRIMARY_FLUSH_INTERVAL_LATENCY_SLOT_PROPOSE_TO_EXECUTE_AVG_MS.set(avg_slot_latency);
 
     // Reset for next interval
     flush_data.reset();
