@@ -15,7 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, PRIMARY_SLOT_HEADERS_BY_NODE, PRIMARY_SLOT_BYTES_BY_NODE, PRIMARY_SLOT_DIGESTS_BY_NODE, PRIMARY_ACTIVE_NODES_IN_SLOT, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, record_flush_interval_commit};
+use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, PRIMARY_DAG_HEIGHT, PRIMARY_SLOT_HEADERS_BY_NODE, PRIMARY_SLOT_BYTES_BY_NODE, PRIMARY_SLOT_DIGESTS_BY_NODE, PRIMARY_ACTIVE_NODES_IN_SLOT, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, record_flush_interval_commit};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -61,6 +61,9 @@ impl State {
 
         let last_committed_round = *self.last_executed_heights.values().max().unwrap();
         self.last_committed_round = last_committed_round;
+        
+        // Update DAG height metric
+        PRIMARY_DAG_HEIGHT.set(last_committed_round as i64);
 
         for (name, round) in &self.last_executed_heights {
             self.dag.retain(|r, authorities| {

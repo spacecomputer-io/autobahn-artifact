@@ -146,7 +146,7 @@ impl Proposer {
                 if let Err(e) = self.tx_core.send(h).await {
                     error!("PROPOSER: CRITICAL - Failed to send header at height {}: {}", self.height, e);
                 }
-                PRIMARY_HEADERS_PROPOSED_TOTAL.inc();
+        PRIMARY_HEADERS_PROPOSED_TOTAL.inc();
             },
             Err(e) => {
                 error!("PROPOSER: CRITICAL - Channel closed at height {}: {}", self.height, e);

@@ -96,6 +96,13 @@ lazy_static! {
         )
         .expect("failed to register primary_pending_slots");
 
+    pub static ref PRIMARY_DAG_HEIGHT: IntGauge =
+        register_int_gauge!(
+            "primary_dag_height",
+            "Height of the highest committed header in the DAG (last committed round)"
+        )
+        .expect("failed to register primary_dag_height");
+
     pub static ref PRIMARY_TIMEOUTS_TOTAL: IntCounter =
         register_int_counter!(
             "primary_timeouts_total",

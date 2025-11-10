@@ -204,15 +204,15 @@ impl BatchMaker {
 
             for id in tx_ids {
                 // NOTE: This log entry is used to compute performance.
-            info!(
-                "Batch {:?} contains sample tx {}",
-                digest,
-                u64::from_be_bytes(id)
-            );
-        }
+                info!(
+                    "Batch {:?} contains sample tx {}",
+                    digest,
+                    u64::from_be_bytes(id)
+                );
+            }
 
         // NOTE: Removed individual batch size logging - now using aggregate stats
-    }
+        }
 
         // Broadcast the batch through the network.
 
@@ -223,7 +223,7 @@ impl BatchMaker {
         
         // Measure broadcast latency
         let broadcast_start = Instant::now();
-        self.network.broadcast(addresses, bytes).await;
+        self.network.broadcast(addresses, bytes).await; 
         let broadcast_elapsed_ms = broadcast_start.elapsed().as_millis() as u64;
         
         // Track broadcast performance
