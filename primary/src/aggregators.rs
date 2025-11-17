@@ -3,6 +3,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult, ConsensusError};
 use crate::messages::{Certificate, Header, Vote, QC, Timeout, TC};
+use crate::metrics::PRIMARY_DAG_CERTIFICATES_FORMED_TOTAL;
 use config::{Committee, Stake};
 use crypto::{PublicKey, Signature, Digest};
 use std::collections::HashSet;
@@ -58,6 +59,8 @@ impl VotesAggregator {
                 };
 
                 self.diss_cert = Some(dissemination_cert);
+                // Metric: dissemination certificate formed (f+1 votes)
+                PRIMARY_DAG_CERTIFICATES_FORMED_TOTAL.inc();
             }
             self.complete = true;
             //return Ok(self.diss_cert.clone());

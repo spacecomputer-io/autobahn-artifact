@@ -118,35 +118,108 @@ lazy_static! {
         .expect("failed to register primary_timeouts_as_leader_total");
 
     // ============================================================================
-    // NEW METRICS - Consensus
+    // DAG-LEVEL METRICS (f+1 consensus for header dissemination)
+    // ============================================================================
+
+    pub static ref PRIMARY_DAG_DIGESTS_OWN_BATCHES_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_dag_digests_own_batches_total",
+            "Total number of own batch digests received from this primary's worker (locally created)"
+        ).expect("failed to register primary_dag_digests_own_batches_total");
+
+    pub static ref PRIMARY_DAG_DIGESTS_OTHERS_BATCHES_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_dag_digests_others_batches_total",
+            "Total number of others' batch digests received from this primary's worker (from network)"
+        ).expect("failed to register primary_dag_digests_others_batches_total");
+
+    pub static ref PRIMARY_DAG_CERTIFICATES_FORMED_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_dag_certificates_formed_total",
+            "Total number of dissemination certificates formed (f+1 votes on headers)"
+        ).expect("failed to register primary_dag_certificates_formed_total");
+
+    pub static ref PRIMARY_DAG_HEADERS_BROADCAST_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_dag_headers_broadcast_total",
+            "Total number of headers broadcast to other primaries"
+        ).expect("failed to register primary_dag_headers_broadcast_total");
+
+    pub static ref PRIMARY_DAG_HEADERS_VOTED_ON_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_dag_headers_voted_on_total",
+            "Total number of headers from other primaries that this node voted on"
+        ).expect("failed to register primary_dag_headers_voted_on_total");
+
+    pub static ref PRIMARY_DAG_NODE_HEIGHT: IntGauge =
+        register_int_gauge!(
+            "primary_dag_node_height",
+            "Height of this primary's own lane in the DAG (latest header proposed by this node)"
+        ).expect("failed to register primary_dag_node_height");
+
+    pub static ref PRIMARY_DAG_CERTIFICATE_SYNC_REQUESTS_SENT_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_dag_certificate_sync_requests_sent_total",
+            "Total number of certificate sync requests sent to other primaries"
+        ).expect("failed to register primary_dag_certificate_sync_requests_sent_total");
+
+    // ============================================================================
+    // SLOT CONSENSUS-LEVEL METRICS (2f+1 Byzantine consensus)
+    // ============================================================================
+
+    pub static ref PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_consensus_prepare_messages_sent_total",
+            "Total number of Prepare messages sent by this primary (as leader)"
+        ).expect("failed to register primary_consensus_prepare_messages_sent_total");
+
+    pub static ref PRIMARY_CONSENSUS_PREPARE_VOTES_SENT_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_consensus_prepare_votes_sent_total",
+            "Total number of Prepare votes (ConsensusVotes) sent for Prepare messages"
+        ).expect("failed to register primary_consensus_prepare_votes_sent_total");
+
+    pub static ref PRIMARY_CONSENSUS_CONFIRM_VOTES_SENT_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_consensus_confirm_votes_sent_total",
+            "Total number of Confirm votes (ConsensusVotes) sent for Confirm messages"
+        ).expect("failed to register primary_consensus_confirm_votes_sent_total");
+
+    pub static ref PRIMARY_CONSENSUS_COMMIT_VOTES_SENT_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_consensus_commit_votes_sent_total",
+            "Total number of Commit votes (ConsensusVotes) sent for Commit messages"
+        ).expect("failed to register primary_consensus_commit_votes_sent_total");
+
+    // ============================================================================
+    // SLOT CONSENSUS PATH TRACKING
     // ============================================================================
 
     // Fast/Slow Path Tracking
-    pub static ref PRIMARY_FAST_PATH_COMMITS_TOTAL: IntCounter =
+    pub static ref PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL: IntCounter =
         register_int_counter!(
-            "primary_fast_path_commits_total",
-            "Total number of commits via fast path"
-        ).expect("failed to register primary_fast_path_commits_total");
+            "primary_consensus_fast_path_commits_total",
+            "Total number of commits via fast path (3f+1 votes)"
+        ).expect("failed to register primary_consensus_fast_path_commits_total");
 
-    pub static ref PRIMARY_SLOW_PATH_COMMITS_TOTAL: IntCounter =
+    pub static ref PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL: IntCounter =
         register_int_counter!(
-            "primary_slow_path_commits_total",
-            "Total number of commits via slow path"
-        ).expect("failed to register primary_slow_path_commits_total");
+            "primary_consensus_slow_path_commits_total",
+            "Total number of commits via slow path (2f+1 Prepare + 2f+1 Confirm)"
+        ).expect("failed to register primary_consensus_slow_path_commits_total");
 
-    // View Changes
-    pub static ref PRIMARY_VIEW_CHANGES_TOTAL: IntCounterVec =
-        register_int_counter_vec!(
-            "primary_view_changes_total",
-            "Total number of view changes per slot",
-            &["slot"]
-        ).expect("failed to register primary_view_changes_total");
-
-    pub static ref PRIMARY_LEADER_CHANGES_TOTAL: IntCounter =
+    // View Changes (Consensus-level)
+    pub static ref PRIMARY_CONSENSUS_VIEW_CHANGES_TOTAL: IntCounter =
         register_int_counter!(
-            "primary_leader_changes_total",
+            "primary_consensus_view_changes_total",
+            "Total number of successful view changes (timeouts with TC formed)"
+        ).expect("failed to register primary_consensus_view_changes_total");
+
+    pub static ref PRIMARY_CONSENSUS_LEADER_CHANGES_TOTAL: IntCounter =
+        register_int_counter!(
+            "primary_consensus_leader_changes_total",
             "Total number of leader changes"
-        ).expect("failed to register primary_leader_changes_total");
+        ).expect("failed to register primary_consensus_leader_changes_total");
 
     // Vote Tracking
     pub static ref PRIMARY_VOTES_SENT_TOTAL: IntCounterVec =

@@ -9,7 +9,7 @@ use crypto::{Digest, PublicKey, SignatureService, Hash};
 use log::{debug, info, warn, error};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
-use crate::metrics::{PRIMARY_HEADERS_PROPOSED_TOTAL, record_propose_time};
+use crate::metrics::{PRIMARY_HEADERS_PROPOSED_TOTAL, record_propose_time, PRIMARY_DAG_NODE_HEIGHT};
 
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
@@ -140,13 +140,15 @@ impl Proposer {
         match self.tx_core.try_send(header) {
             Ok(_) => {
                 PRIMARY_HEADERS_PROPOSED_TOTAL.inc();
+                PRIMARY_DAG_NODE_HEIGHT.set(self.height as i64);
             },
             Err(tokio::sync::mpsc::error::TrySendError::Full(h)) => {
                 warn!("PROPOSER: tx_core channel FULL at height {}! Core may be overloaded processing headers", self.height);
                 if let Err(e) = self.tx_core.send(h).await {
                     error!("PROPOSER: CRITICAL - Failed to send header at height {}: {}", self.height, e);
                 }
-        PRIMARY_HEADERS_PROPOSED_TOTAL.inc();
+                PRIMARY_HEADERS_PROPOSED_TOTAL.inc();
+                PRIMARY_DAG_NODE_HEIGHT.set(self.height as i64);
             },
             Err(e) => {
                 error!("PROPOSER: CRITICAL - Channel closed at height {}: {}", self.height, e);

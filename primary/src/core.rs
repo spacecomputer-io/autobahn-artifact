@@ -22,8 +22,11 @@ use log::{debug, error, warn, info};
 use crate::metrics::{
     PRIMARY_TIMEOUTS_TOTAL, PRIMARY_TIMEOUTS_AS_LEADER_TOTAL,
     PRIMARY_VOTES_SENT_TOTAL, PRIMARY_VOTES_RECEIVED_TOTAL, PRIMARY_VOTES_REFUSED_TOTAL,
-    PRIMARY_VIEW_CHANGES_TOTAL, PRIMARY_LEADER_CHANGES_TOTAL,
-    PRIMARY_HEADER_SYNC_REQUESTS_SENT_TOTAL
+    PRIMARY_CONSENSUS_VIEW_CHANGES_TOTAL, PRIMARY_CONSENSUS_LEADER_CHANGES_TOTAL,
+    PRIMARY_HEADER_SYNC_REQUESTS_SENT_TOTAL,
+    PRIMARY_DAG_HEADERS_BROADCAST_TOTAL, PRIMARY_DAG_HEADERS_VOTED_ON_TOTAL,
+    PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL, PRIMARY_CONSENSUS_PREPARE_VOTES_SENT_TOTAL,
+    PRIMARY_CONSENSUS_CONFIRM_VOTES_SENT_TOTAL, PRIMARY_DAG_CERTIFICATE_SYNC_REQUESTS_SENT_TOTAL
 };
 use network::{CancelHandler, ReliableSender};
 use core::panic;
@@ -308,6 +311,9 @@ impl Core {
             .entry(header.height)
             .or_insert_with(Vec::new)
             .extend(handlers);
+        
+        // Metric: header broadcast to other primaries
+        PRIMARY_DAG_HEADERS_BROADCAST_TOTAL.inc();
 
         // Process the header.
         self.process_header(header, false).await
@@ -447,6 +453,11 @@ impl Core {
             .or_insert_with(HashSet::new)
             .insert(header.author)
         {
+            // Metric: voted on a header from another primary
+            if header.author != self.name {
+                PRIMARY_DAG_HEADERS_VOTED_ON_TOTAL.inc();
+            }
+            
             //println!("voting for header");
             // Process the consensus instances contained in the header (if any)
             let consensus_votes = self
@@ -1015,6 +1026,11 @@ impl Core {
 
         debug!("Send req for Consensus message {}", consensus_message);
 
+        // Metric: Track when this node sends a Prepare message (as leader)
+        if let ConsensusMessage::Prepare { .. } = &consensus_message {
+            PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL.inc();
+        }
+
         let consensus_req = ConsensusRequest::new(self.name, consensus_message, &mut self.signature_service).await;
 
         //send to all others
@@ -1576,6 +1592,8 @@ impl Core {
                     .request_signature(prepare_message.digest())
                     .await;
                 consensus_sigs.push((*slot, prepare_message.digest(), sig));
+                // Metric: Prepare vote sent
+                PRIMARY_CONSENSUS_PREPARE_VOTES_SENT_TOTAL.inc();
                 debug!("Prepare-Vote for slot: {}, view: {},has digest: {}", slot, view, prepare_message.digest());
             }
             _ => {}
@@ -1606,6 +1624,8 @@ impl Core {
                     .request_signature(confirm_message.digest())
                     .await;
                 consensus_sigs.push((*slot, confirm_message.digest(), sig));
+                // Metric: Confirm vote sent
+                PRIMARY_CONSENSUS_CONFIRM_VOTES_SENT_TOTAL.inc();
                 debug!("Confirm-Vote for slot: {}, view: {}, qc_dig {:?} -> has digest: {}", slot, view, qc.id , confirm_message.digest());
             }
             _ => {}
@@ -1951,14 +1971,14 @@ impl Core {
         if let Some(tc) = tc_maker.append(timeout.clone(), &self.committee)? {
             debug!("Assembled TimeoutCertificate {:?}", tc);
 
-            // Track view change
-            PRIMARY_VIEW_CHANGES_TOTAL.with_label_values(&[&timeout.slot.to_string()]).inc();
+            // Track view change (successful timeout with TC formed)
+            PRIMARY_CONSENSUS_VIEW_CHANGES_TOTAL.inc();
 
             // Check if leader changed
             let old_leader = self.leader_elector.get_leader(timeout.slot, timeout.view);
             let new_leader = self.leader_elector.get_leader(timeout.slot, timeout.view + 1);
             if old_leader != new_leader {
-                PRIMARY_LEADER_CHANGES_TOTAL.inc();
+                PRIMARY_CONSENSUS_LEADER_CHANGES_TOTAL.inc();
             }
 
             // Try to advance the view
