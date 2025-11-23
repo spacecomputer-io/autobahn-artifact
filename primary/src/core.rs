@@ -26,7 +26,8 @@ use crate::metrics::{
     PRIMARY_HEADER_SYNC_REQUESTS_SENT_TOTAL,
     PRIMARY_DAG_HEADERS_BROADCAST_TOTAL, PRIMARY_DAG_HEADERS_VOTED_ON_TOTAL,
     PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL, PRIMARY_CONSENSUS_PREPARE_VOTES_SENT_TOTAL,
-    PRIMARY_CONSENSUS_CONFIRM_VOTES_SENT_TOTAL, PRIMARY_DAG_CERTIFICATE_SYNC_REQUESTS_SENT_TOTAL
+    PRIMARY_CONSENSUS_CONFIRM_VOTES_SENT_TOTAL, PRIMARY_DAG_CERTIFICATE_SYNC_REQUESTS_SENT_TOTAL,
+    PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL, PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL
 };
 use network::{CancelHandler, ReliableSender};
 use core::panic;
@@ -741,6 +742,7 @@ impl Core {
                             let new_consensus_message = match qc_maker.try_fast {
                                 true => {
                                     debug!("taking fast path!");
+                                    PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
                                     ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                     }, // Create Commit if we have FastPrepareQC
                                 false => ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() },
@@ -756,6 +758,7 @@ impl Core {
                         ConsensusMessage::Confirm {slot, view, qc: _,proposals,}
                         => {
                             debug!("Commit QC formed in slot {:?}", slot);
+                            PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL.inc();
                             let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
                             // Send this new instance to the proposer
@@ -936,6 +939,7 @@ impl Core {
                         let new_consensus_message = match qc_maker.try_fast {
                             true => {
                                 debug!("taking fast path!");
+                                PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
                                 ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                 }, // Create Commit if we have FastPrepareQC
                             false => ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() },
@@ -948,6 +952,7 @@ impl Core {
                     ConsensusMessage::Confirm {slot, view, qc: _,proposals,}
                     => {
                         debug!("Commit QC formed in slot {:?}", slot);
+                        PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL.inc();
                         let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
                         // continue with next consensus phase

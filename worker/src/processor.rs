@@ -16,7 +16,7 @@ use crate::metrics::WORKER_DIGESTS_SENT_TO_PRIMARY_TOTAL;
 pub mod processor_tests;
 
 /// Indicates a serialized `WorkerMessage::Batch` message.
-pub type SerializedBatchMessage = (Vec<u8>, Option<u64>);
+pub type SerializedBatchMessage = (Vec<u8>, Option<u64>, u64); // (serialized_batch, first_tx_submit_ms, tx_count)
 
 /// Hashes and stores batches, it then outputs the batch's digest.
 pub struct Processor;
@@ -43,7 +43,7 @@ impl Processor {
             let mut store_latencies: Vec<u64> = Vec::with_capacity(1000); // Track for percentiles
             let mut last_storage_state_log = std::time::Instant::now();
             
-            while let Some((batch, first_tx_at_ms)) = rx_batch.recv().await {
+            while let Some((batch, first_tx_at_ms, tx_count)) = rx_batch.recv().await {
                 // Hash the batch.
                 let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
                 let batch_size_bytes = batch.len() as u64;
@@ -86,7 +86,7 @@ impl Processor {
                 // Deliver the batch's digest.
                 let digest_copy = digest.clone();
                 let message = match own_digest {
-                    true => WorkerPrimaryMessage::OurBatch(digest, id, first_tx_at_ms.unwrap_or(0), batch_size_bytes),
+                    true => WorkerPrimaryMessage::OurBatch(digest, id, first_tx_at_ms.unwrap_or(0), batch_size_bytes, tx_count),
                     false => WorkerPrimaryMessage::OthersBatch(digest, id, batch_size_bytes),
                 };
                 

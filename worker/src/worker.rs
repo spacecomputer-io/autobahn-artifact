@@ -294,11 +294,14 @@ impl MessageHandler for WorkerReceiverHandler {
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self     //If receive batch message from another worker. Store the batch, and process.
-                .tx_processor
-                .send((serialized.to_vec(), None))
-                .await
-                .expect("Failed to send batch"),
+            Ok(WorkerMessage::Batch(batch)) => {
+                let tx_count = batch.len() as u64;
+                self     //If receive batch message from another worker. Store the batch, and process.
+                    .tx_processor
+                    .send((serialized.to_vec(), None, tx_count))
+                    .await
+                    .expect("Failed to send batch")
+            },
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self  //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
                 .tx_helper
                 .send((missing, requestor))

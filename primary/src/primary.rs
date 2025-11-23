@@ -22,7 +22,7 @@ use futures::sink::SinkExt as _;
 use log::{info, debug, warn, error};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use crate::metrics::{
-    record_batch_arrival, record_tx_submit_ms, observe_tx_submit_to_commit_latency, record_batch_size_bytes,
+    record_batch_arrival, record_tx_submit_ms, observe_tx_submit_to_commit_latency, record_batch_size_bytes, record_tx_count,
     PRIMARY_DAG_DIGESTS_OWN_BATCHES_TOTAL, PRIMARY_DAG_DIGESTS_OTHERS_BATCHES_TOTAL
 };
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,7 @@ pub enum PrimaryWorkerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
-    OurBatch(Digest, WorkerId, /* first_tx_submit_ms */ u64, /* batch_size_bytes */ u64),
+    OurBatch(Digest, WorkerId, /* first_tx_submit_ms */ u64, /* batch_size_bytes */ u64, /* tx_count */ u64),
     /// The worker indicates it received a batch's digest from another authority.
     OthersBatch(Digest, WorkerId, /* batch_size_bytes */ u64),
 }
@@ -339,10 +339,11 @@ impl MessageHandler for WorkerReceiverHandler {
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
             Ok(message) => match message {
-                WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes) => {
+                WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes, tx_count) => {
                     PRIMARY_DAG_DIGESTS_OWN_BATCHES_TOTAL.inc();
                     record_batch_arrival(&digest);
                     record_batch_size_bytes(&digest, batch_size_bytes);
+                    record_tx_count(&digest, tx_count);
                     if first_tx_submit_ms > 0 { record_tx_submit_ms(&digest, first_tx_submit_ms); }
                     
                     // Use try_send to detect channel backpressure

@@ -188,6 +188,7 @@ impl BatchMaker {
 
         // Serialize the batch.
         self.current_batch_size = 0;
+        let tx_count = self.current_batch.len() as u64; // Track transaction count
         let batch: Vec<_> = self.current_batch.drain(..).collect();
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
@@ -236,7 +237,7 @@ impl BatchMaker {
         } 
 
         let submit_ms = self.first_tx_submit_ms.take();
-        self.tx_batch.send((serialized, submit_ms)).await.expect("Failed to deliver batch");
+        self.tx_batch.send((serialized, submit_ms, tx_count)).await.expect("Failed to deliver batch");
         WORKER_BATCHES_SEALED_TOTAL.inc();
         WORKER_BATCH_SIZE_BYTES.set(sealed_size as i64);
 

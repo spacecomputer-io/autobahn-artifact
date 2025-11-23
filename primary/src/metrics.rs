@@ -391,6 +391,7 @@ lazy_static! {
     static ref BATCH_ARRIVAL_TIMES: Mutex<HashMap<Digest, Instant>> = Mutex::new(HashMap::new());
     static ref SUBMIT_MS_BY_BATCH: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
     static ref BATCH_SIZE_BYTES_BY_DIGEST: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
+    static ref TX_COUNT_BY_DIGEST: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
     static ref FLUSH_INTERVAL_DATA: Mutex<FlushIntervalData> = Mutex::new(FlushIntervalData::new());
     static ref SLOT_PROPOSE_TIMES: Mutex<HashMap<u64, Instant>> = Mutex::new(HashMap::new());
 }
@@ -482,16 +483,26 @@ pub fn take_batch_size_bytes(digest: &Digest) -> u64 {
     map.remove(digest).unwrap_or(0)
 }
 
+pub fn record_tx_count(digest: &Digest, tx_count: u64) {
+    let mut map = TX_COUNT_BY_DIGEST.lock().unwrap();
+    map.insert(digest.clone(), tx_count);
+}
+
+pub fn take_tx_count(digest: &Digest) -> u64 {
+    let mut map = TX_COUNT_BY_DIGEST.lock().unwrap();
+    map.remove(digest).unwrap_or(0)
+}
+
 // ============================================================================
 // Helper Functions - Flush Interval Tracking
 // ============================================================================
 
-pub fn record_flush_interval_commit(num_digests: usize, bytes: u64) {
+pub fn record_flush_interval_commit(num_digests: usize, bytes: u64, transactions: u64) {
     let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
     flush_data.commit_count += 1;
     flush_data.digest_count += num_digests as u64;
     flush_data.byte_count += bytes;
-    // Note: transaction_count would need to be passed in or computed separately
+    flush_data.transaction_count += transactions;
 }
 
 /// Calculate rates and update flush interval metrics, then reset the accumulator

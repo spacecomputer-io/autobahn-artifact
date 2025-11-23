@@ -15,7 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, PRIMARY_DAG_HEIGHT, PRIMARY_SLOT_HEADERS_BY_NODE, PRIMARY_SLOT_BYTES_BY_NODE, PRIMARY_SLOT_DIGESTS_BY_NODE, PRIMARY_ACTIVE_NODES_IN_SLOT, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, record_flush_interval_commit};
+use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, PRIMARY_DAG_HEIGHT, PRIMARY_SLOT_HEADERS_BY_NODE, PRIMARY_SLOT_BYTES_BY_NODE, PRIMARY_SLOT_DIGESTS_BY_NODE, PRIMARY_ACTIVE_NODES_IN_SLOT, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, take_tx_count, record_flush_interval_commit};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -149,6 +149,7 @@ impl Committer {
                             let sync_start = std::time::Instant::now();
                             let mut total_headers_committed = 0;
                             let mut active_nodes = HashSet::new();
+                            let mut all_digests_in_slot: Vec<Digest> = Vec::new(); // Collect all digests to observe latency AFTER slot commit
                             
                             for (pk, proposal) in proposals {
                                 let stop_height = *state.last_executed_heights.get(pk).unwrap();
@@ -197,13 +198,16 @@ impl Committer {
                                     PRIMARY_COMMITS_TOTAL.inc();
                                     observe_propose_to_commit_latency(&header.id);
                                     
-                                    // Observe batch ingress->commit for all digests in this committed header
+                                    // Collect bytes and transactions for this header
                                     let mut total_bytes: u64 = 0;
+                                    let mut total_transactions: u64 = 0;
                                     let num_digests = header.payload.len();
                                     for (digest, _) in header.payload.iter() {
-                                        observe_batch_ingress_to_commit_latency(digest);
-                                        observe_tx_submit_to_commit_latency(digest);
+                                        // IMPORTANT: Don't observe latencies here! We're still committing headers.
+                                        // Collect digests to observe latency AFTER the SLOT is fully committed.
+                                        all_digests_in_slot.push(digest.clone());
                                         total_bytes = total_bytes.saturating_add(take_batch_size_bytes(digest));
+                                        total_transactions = total_transactions.saturating_add(take_tx_count(digest));
                                     }
                                     
                                     // Track per-node bytes and digests
@@ -211,7 +215,7 @@ impl Committer {
                                     PRIMARY_SLOT_DIGESTS_BY_NODE.with_label_values(&[&author_str]).inc_by(num_digests as u64);
                                     
                                     // Record data for flush interval metrics
-                                    record_flush_interval_commit(num_digests, total_bytes);
+                                    record_flush_interval_commit(num_digests, total_bytes, total_transactions);
                                     
                                     debug!("Finish upcall");
                                 }
@@ -226,6 +230,13 @@ impl Committer {
                             // Record slot execution metrics
                             PRIMARY_SLOT_EXECUTION_LATENCY.observe(slot_elapsed_ms);
                             PRIMARY_SLOTS_EXECUTED_TOTAL.inc();
+                            
+                            // IMPORTANT: Now that the SLOT is fully committed, observe latencies for all digests
+                            // This measures tx_submit → SLOT commit (not header commit)
+                            for digest in all_digests_in_slot.iter() {
+                                observe_batch_ingress_to_commit_latency(digest);
+                                observe_tx_submit_to_commit_latency(digest);
+                            }
                             
                             // Record end-to-end slot propose-to-execute latency
                             #[cfg(feature = "benchmark")]
