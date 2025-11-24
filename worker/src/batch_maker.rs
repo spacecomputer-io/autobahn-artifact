@@ -114,6 +114,7 @@ impl BatchMaker {
                     // Record first tx timestamp for this batch
                     if self.current_batch.is_empty() && self.first_tx_submit_ms.is_none() {
                         self.first_tx_submit_ms = Some(arrival_ts_ms);
+                        log::debug!("BatchMaker: Starting new batch with first_tx_ts={}", arrival_ts_ms);
                     }
                     
                     self.current_batch_size += transaction.len();
@@ -249,6 +250,13 @@ impl BatchMaker {
         } 
 
         let submit_ms = self.first_tx_submit_ms.take();
+        if let Some(ts) = submit_ms {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+            let elapsed = now.saturating_sub(ts);
+            log::debug!("BatchMaker: Sealing batch, first_tx_ts={}, now={}, batch_creation_time={}ms", ts, now, elapsed);
+        } else {
+            log::warn!("BatchMaker: Sealing batch but first_tx_submit_ms is None!");
+        }
         self.tx_batch.send((serialized, submit_ms, tx_count)).await.expect("Failed to deliver batch");
         WORKER_BATCHES_SEALED_TOTAL.inc();
         WORKER_BATCH_SIZE_BYTES.set(sealed_size as i64);

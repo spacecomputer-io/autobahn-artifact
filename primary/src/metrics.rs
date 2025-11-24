@@ -444,11 +444,25 @@ pub fn observe_tx_submit_to_commit_latency(digest: &Digest) {
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         if now_ms >= start_ms {
             let latency_ms = (now_ms - start_ms) as f64;
+            
+            // DEBUG: Sample logging
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 100 == 0 {
+                log::info!("PRIMARY LATENCY DEBUG #{}: digest={:?}, start_ms={}, now_ms={}, latency={}ms", 
+                          count, digest, start_ms, now_ms, latency_ms);
+            }
+            
             PRIMARY_LATENCY_MS.with_label_values(&["tx_submit_to_commit"]).observe(latency_ms);
 
             let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
             flush_data.tx_submit_to_commit_latencies_ms.push(latency_ms);
+        } else {
+            log::error!("PRIMARY LATENCY ERROR: now_ms ({}) < start_ms ({}) for digest {:?} - CLOCK SKEW!", 
+                       now_ms, start_ms, digest);
         }
+    } else {
+        log::warn!("PRIMARY LATENCY WARNING: No timestamp found for digest {:?} when trying to measure latency", digest);
     }
 }
 

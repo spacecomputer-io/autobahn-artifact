@@ -111,7 +111,7 @@ impl Primary {
         let (_tx_mempool, rx_mempool) = channel(CHANNEL_CAPACITY);
 
         // VERSION IDENTIFIER - Log version to verify which code is running
-        info!("🚀 PRIMARY VERSION: prometheus-metrics-csv-export-v1");
+        info!("🚀 PRIMARY VERSION: prometheus-metrics-csv-export-v2");
 
         // Write the parameters to the logs.
         // NOTE: These log entries are needed to compute performance.
@@ -344,7 +344,12 @@ impl MessageHandler for WorkerReceiverHandler {
                     record_batch_arrival(&digest);
                     record_batch_size_bytes(&digest, batch_size_bytes);
                     record_tx_count(&digest, tx_count);
-                    if first_tx_submit_ms > 0 { record_tx_submit_ms(&digest, first_tx_submit_ms); }
+                    if first_tx_submit_ms > 0 {
+                        record_tx_submit_ms(&digest, first_tx_submit_ms);
+                        log::debug!("PRIMARY DEBUG: Recorded OurBatch with timestamp={}, digest={:?}", first_tx_submit_ms, digest);
+                    } else {
+                        log::warn!("PRIMARY DEBUG: OurBatch has timestamp=0! digest={:?}", digest);
+                    }
                     
                     // Use try_send to detect channel backpressure
                     let digest_copy = digest.clone();

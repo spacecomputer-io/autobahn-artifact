@@ -73,7 +73,7 @@ impl Worker {
         };
 
         // VERSION IDENTIFIER - Log version to verify which code is running
-        info!("🚀 WORKER {} VERSION: prometheus-metrics-csv-export-v1", id);
+        info!("🚀 WORKER {} VERSION: prometheus-metrics-csv-export-v2", id);
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
@@ -267,6 +267,13 @@ impl MessageHandler for TxReceiverHandler {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        
+        // DEBUG: Log every 1000th transaction
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count % 1000 == 0 {
+            log::info!("WORKER DEBUG: TX #{} arrived at network, timestamp={}", count, arrival_ts_ms);
+        }
         
         // Prepend 8-byte timestamp to transaction
         let mut timestamped_tx = Vec::with_capacity(8 + message.len());
