@@ -262,9 +262,20 @@ struct TxReceiverHandler {
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+        // Record arrival timestamp (first 8 bytes) + transaction data
+        let arrival_ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        
+        // Prepend 8-byte timestamp to transaction
+        let mut timestamped_tx = Vec::with_capacity(8 + message.len());
+        timestamped_tx.extend_from_slice(&arrival_ts_ms.to_le_bytes());
+        timestamped_tx.extend_from_slice(&message);
+        
         // Send the transaction to the batch maker.
         self.tx_batch_maker
-            .send(message.to_vec())
+            .send(timestamped_tx)
             .await
             .expect("Failed to send transaction");
         WORKER_TRANSACTIONS_RECEIVED_TOTAL.inc();

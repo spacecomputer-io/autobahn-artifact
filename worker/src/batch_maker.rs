@@ -11,7 +11,6 @@ use crypto::PublicKey;
 use ed25519_dalek::{Digest as _, Sha512};
 use log::{debug, info, warn};
 use network::{ReliableSender, SimpleSender};
-#[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -99,11 +98,24 @@ impl BatchMaker {
         loop {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
-                Some(transaction) = self.rx_transaction.recv() => {
-                    if self.current_batch.is_empty() && self.first_tx_submit_ms.is_none() {
-                        let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-                        self.first_tx_submit_ms = Some(ts_ms);
+                Some(timestamped_transaction) = self.rx_transaction.recv() => {
+                    // Extract timestamp from first 8 bytes
+                    if timestamped_transaction.len() < 8 {
+                        warn!("BatchMaker: Received transaction too short to contain timestamp");
+                        continue;
                     }
+                    
+                    let ts_bytes: [u8; 8] = timestamped_transaction[0..8].try_into().unwrap();
+                    let arrival_ts_ms = u64::from_le_bytes(ts_bytes);
+                    
+                    // Strip timestamp to get original transaction
+                    let transaction = timestamped_transaction[8..].to_vec();
+                    
+                    // Record first tx timestamp for this batch
+                    if self.current_batch.is_empty() && self.first_tx_submit_ms.is_none() {
+                        self.first_tx_submit_ms = Some(arrival_ts_ms);
+                    }
+                    
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     tx_count += 1;
