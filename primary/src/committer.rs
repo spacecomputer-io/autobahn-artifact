@@ -15,7 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, PRIMARY_DAG_HEIGHT, PRIMARY_SLOT_HEADERS_BY_NODE, PRIMARY_SLOT_BYTES_BY_NODE, PRIMARY_SLOT_DIGESTS_BY_NODE, PRIMARY_ACTIVE_NODES_IN_SLOT, observe_propose_to_commit_latency, observe_batch_ingress_to_commit_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, take_tx_count, record_flush_interval_commit};
+use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, PRIMARY_DAG_HEIGHT, PRIMARY_SLOT_HEADERS_BY_NODE, PRIMARY_SLOT_BYTES_BY_NODE, PRIMARY_SLOT_DIGESTS_BY_NODE, PRIMARY_ACTIVE_NODES_IN_SLOT, observe_slot_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, take_tx_count, record_flush_interval_commit};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -196,7 +196,6 @@ impl Committer {
                                         debug!("Failed to send block through the output channel: {}", e);
                                     }
                                     PRIMARY_COMMITS_TOTAL.inc();
-                                    observe_propose_to_commit_latency(&header.id);
                                     
                                     // Collect bytes and transactions for this header
                                     let mut total_bytes: u64 = 0;
@@ -231,18 +230,12 @@ impl Committer {
                             PRIMARY_SLOT_EXECUTION_LATENCY.observe(slot_elapsed_ms);
                             PRIMARY_SLOTS_EXECUTED_TOTAL.inc();
                             
-                            // IMPORTANT: Now that the SLOT is fully committed, observe latencies for all digests
-                            // This measures tx_submit → SLOT commit (not header commit)
-                            for digest in all_digests_in_slot.iter() {
-                                observe_batch_ingress_to_commit_latency(digest);
-                                observe_tx_submit_to_commit_latency(digest);
-                            }
+                            // NEW: Record slot-level latency (observer or leader)
+                            observe_slot_latency(state.last_executed_slot + 1);
                             
-                            // Record end-to-end slot propose-to-execute latency
-                            #[cfg(feature = "benchmark")]
-                            {
-                                use crate::metrics::observe_slot_propose_to_execute_latency;
-                                observe_slot_propose_to_execute_latency(state.last_executed_slot + 1);
+                            // Record TX latencies for all digests in the slot
+                            for digest in all_digests_in_slot.iter() {
+                                observe_tx_submit_to_commit_latency(digest);
                             }
                             
                             if slot_elapsed.as_millis() > 50 {

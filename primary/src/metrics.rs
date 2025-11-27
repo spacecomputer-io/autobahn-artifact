@@ -15,10 +15,11 @@ pub struct FlushIntervalData {
     pub digest_count: u64,
     pub byte_count: u64,
     pub transaction_count: u64,
-    pub propose_to_commit_latencies_ms: Vec<f64>,
-    pub batch_ingress_to_commit_latencies_ms: Vec<f64>,
-    pub tx_submit_to_commit_latencies_ms: Vec<f64>,
-    pub slot_propose_to_execute_latencies_ms: Vec<f64>,
+    
+    // NEW LATENCY METRICS (redesigned)
+    pub leader_latencies_ms: Vec<f64>,      // Leader: Prepare send → Slot execute
+    pub observer_latencies_ms: Vec<f64>,    // Observer: Prepare receive → Slot execute  
+    pub tx_to_commit_latencies_ms: Vec<f64>, // End-to-end: TX arrival at worker → Slot execute
 }
 
 impl FlushIntervalData {
@@ -28,10 +29,9 @@ impl FlushIntervalData {
             digest_count: 0,
             byte_count: 0,
             transaction_count: 0,
-            propose_to_commit_latencies_ms: Vec::new(),
-            batch_ingress_to_commit_latencies_ms: Vec::new(),
-            tx_submit_to_commit_latencies_ms: Vec::new(),
-            slot_propose_to_execute_latencies_ms: Vec::new(),
+            leader_latencies_ms: Vec::new(),
+            observer_latencies_ms: Vec::new(),
+            tx_to_commit_latencies_ms: Vec::new(),
         }
     }
 
@@ -40,10 +40,9 @@ impl FlushIntervalData {
         self.digest_count = 0;
         self.byte_count = 0;
         self.transaction_count = 0;
-        self.propose_to_commit_latencies_ms.clear();
-        self.batch_ingress_to_commit_latencies_ms.clear();
-        self.tx_submit_to_commit_latencies_ms.clear();
-        self.slot_propose_to_execute_latencies_ms.clear();
+        self.leader_latencies_ms.clear();
+        self.observer_latencies_ms.clear();
+        self.tx_to_commit_latencies_ms.clear();
     }
 
     pub fn calculate_avg_latency(latencies: &[f64]) -> f64 {
@@ -325,32 +324,27 @@ lazy_static! {
         ).expect("failed to register primary_throughput_tx_per_second");
 
     // ============================================================================
-    // LATENCY GAUGES - Flush Interval Averages
+    // LATENCY GAUGES - Flush Interval Averages (NEW CLEAN METRICS)
     // ============================================================================
 
-    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_PROPOSE_TO_COMMIT_AVG_MS: Gauge =
+    // NEW CLEAN LATENCY METRICS
+    pub static ref PRIMARY_OBSERVER_LATENCY_AVG_MS: Gauge =
         register_gauge!(
-            "primary_flush_interval_latency_propose_to_commit_avg_ms",
-            "Average propose-to-commit latency in the last flush interval (milliseconds)"
-        ).expect("failed to register primary_flush_interval_latency_propose_to_commit_avg_ms");
+            "primary_observer_latency_avg_ms",
+            "Average consensus latency when NOT leader: Prepare receive → Slot execute (ms)"
+        ).expect("failed to register primary_observer_latency_avg_ms");
 
-    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_BATCH_TO_COMMIT_AVG_MS: Gauge =
+    pub static ref PRIMARY_LEADER_LATENCY_AVG_MS: Gauge =
         register_gauge!(
-            "primary_flush_interval_latency_batch_to_commit_avg_ms",
-            "Average batch-ingress-to-commit latency in the last flush interval (milliseconds)"
-        ).expect("failed to register primary_flush_interval_latency_batch_to_commit_avg_ms");
+            "primary_leader_latency_avg_ms",
+            "Average consensus latency when IS leader: Prepare send → Slot execute (ms)"
+        ).expect("failed to register primary_leader_latency_avg_ms");
 
     pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_TX_TO_COMMIT_AVG_MS: Gauge =
         register_gauge!(
             "primary_flush_interval_latency_tx_to_commit_avg_ms",
-            "Average tx-submit-to-commit latency in the last flush interval (milliseconds)"
+            "Average end-to-end latency: TX arrival at worker → Slot execute (ms)"
         ).expect("failed to register primary_flush_interval_latency_tx_to_commit_avg_ms");
-
-    pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_SLOT_PROPOSE_TO_EXECUTE_AVG_MS: Gauge =
-        register_gauge!(
-            "primary_flush_interval_latency_slot_propose_to_execute_avg_ms",
-            "Average slot-propose-to-execute latency in the last flush interval (milliseconds)"
-        ).expect("failed to register primary_flush_interval_latency_slot_propose_to_execute_avg_ms");
 
     // ============================================================================
     // PER-NODE SLOT CONTRIBUTION METRICS
@@ -387,99 +381,69 @@ lazy_static! {
     // Internal State for Tracking
     // ============================================================================
 
-    static ref PROPOSE_TIMES: Mutex<HashMap<Digest, Instant>> = Mutex::new(HashMap::new());
-    static ref BATCH_ARRIVAL_TIMES: Mutex<HashMap<Digest, Instant>> = Mutex::new(HashMap::new());
+    // Slot-level latency tracking (NEW)
+    static ref SLOT_PREPARE_TIMES: Mutex<HashMap<u64, (Instant, bool)>> = Mutex::new(HashMap::new()); // slot → (timestamp, is_leader)
+    
+    // TX-level latency tracking (KEEP EXISTING)
     static ref SUBMIT_MS_BY_BATCH: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
+    
+    // Batch metadata tracking
     static ref BATCH_SIZE_BYTES_BY_DIGEST: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
     static ref TX_COUNT_BY_DIGEST: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
+    
+    // Flush interval accumulator
     static ref FLUSH_INTERVAL_DATA: Mutex<FlushIntervalData> = Mutex::new(FlushIntervalData::new());
-    static ref SLOT_PROPOSE_TIMES: Mutex<HashMap<u64, Instant>> = Mutex::new(HashMap::new());
 }
 
 // ============================================================================
 // Helper Functions - Latency Tracking (Now in Milliseconds)
 // ============================================================================
 
-pub fn record_propose_time(header_id: &Digest) {
-    let mut map = PROPOSE_TIMES.lock().unwrap();
-    map.insert(header_id.clone(), Instant::now());
+/// Record when this node sends a Prepare message AS LEADER
+pub fn record_leader_prepare_send(slot: u64) {
+    let mut map = SLOT_PREPARE_TIMES.lock().unwrap();
+    map.insert(slot, (Instant::now(), true)); // true = is_leader
 }
 
-pub fn observe_propose_to_commit_latency(header_id: &Digest) {
-    let mut map = PROPOSE_TIMES.lock().unwrap();
-    if let Some(start) = map.remove(header_id) {
-        let latency_ms = start.elapsed().as_millis() as f64;
-        PRIMARY_LATENCY_MS.with_label_values(&["propose_to_commit"]).observe(latency_ms);
+/// Record when this node receives a Prepare message AS OBSERVER
+pub fn record_observer_prepare_receive(slot: u64) {
+    let mut map = SLOT_PREPARE_TIMES.lock().unwrap();
+    // Only record if not already recorded (avoid duplicate receives)
+    map.entry(slot).or_insert((Instant::now(), false)); // false = is_observer
+}
 
-        // Also accumulate for flush interval
+/// Calculate latency for a slot execution (called from committer)
+pub fn observe_slot_latency(slot: u64) {
+    let mut map = SLOT_PREPARE_TIMES.lock().unwrap();
+    if let Some((start_time, is_leader)) = map.remove(&slot) {
+        let latency_ms = start_time.elapsed().as_millis() as f64;
+        
+        // Add to appropriate bucket based on whether we were leader or observer
         let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
-        flush_data.propose_to_commit_latencies_ms.push(latency_ms);
+        if is_leader {
+            flush_data.leader_latencies_ms.push(latency_ms);
+        } else {
+            flush_data.observer_latencies_ms.push(latency_ms);
+        }
     }
 }
 
-pub fn record_batch_arrival(digest: &Digest) {
-    let mut map = BATCH_ARRIVAL_TIMES.lock().unwrap();
-    map.insert(digest.clone(), Instant::now());
-}
-
-pub fn observe_batch_ingress_to_commit_latency(digest: &Digest) {
-    let mut map = BATCH_ARRIVAL_TIMES.lock().unwrap();
-    if let Some(start) = map.remove(digest) {
-        let latency_ms = start.elapsed().as_millis() as f64;
-        PRIMARY_LATENCY_MS.with_label_values(&["batch_ingress_to_commit"]).observe(latency_ms);
-
-        let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
-        flush_data.batch_ingress_to_commit_latencies_ms.push(latency_ms);
-    }
-}
-
+/// Record when a TX was submitted to worker (keep existing for TX latency)
 pub fn record_tx_submit_ms(digest: &Digest, ts_ms: u64) {
     let mut map = SUBMIT_MS_BY_BATCH.lock().unwrap();
     map.insert(digest.clone(), ts_ms);
 }
 
+/// Calculate TX latency when batch is committed (simplified)
 pub fn observe_tx_submit_to_commit_latency(digest: &Digest) {
     let mut map = SUBMIT_MS_BY_BATCH.lock().unwrap();
     if let Some(start_ms) = map.remove(digest) {
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         if now_ms >= start_ms {
             let latency_ms = (now_ms - start_ms) as f64;
-            
-            // DEBUG: Sample logging
-            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count % 100 == 0 {
-                log::info!("PRIMARY LATENCY DEBUG #{}: digest={:?}, start_ms={}, now_ms={}, latency={}ms", 
-                          count, digest, start_ms, now_ms, latency_ms);
-            }
-            
-            PRIMARY_LATENCY_MS.with_label_values(&["tx_submit_to_commit"]).observe(latency_ms);
-
             let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
-            flush_data.tx_submit_to_commit_latencies_ms.push(latency_ms);
-        } else {
-            log::error!("PRIMARY LATENCY ERROR: now_ms ({}) < start_ms ({}) for digest {:?} - CLOCK SKEW!", 
-                       now_ms, start_ms, digest);
+            flush_data.tx_to_commit_latencies_ms.push(latency_ms);
         }
-    } else {
-        log::warn!("PRIMARY LATENCY WARNING: No timestamp found for digest {:?} when trying to measure latency", digest);
-    }
-}
-
-pub fn record_slot_propose_time(slot: u64) {
-    let mut map = SLOT_PROPOSE_TIMES.lock().unwrap();
-    map.insert(slot, Instant::now());
-}
-
-pub fn observe_slot_propose_to_execute_latency(slot: u64) {
-    let mut map = SLOT_PROPOSE_TIMES.lock().unwrap();
-    if let Some(start) = map.remove(&slot) {
-        let latency_ms = start.elapsed().as_millis() as f64;
-        PRIMARY_LATENCY_MS.with_label_values(&["slot_propose_to_execute"]).observe(latency_ms);
-
-        // Also accumulate for flush interval
-        let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
-        flush_data.slot_propose_to_execute_latencies_ms.push(latency_ms);
     }
 }
 
@@ -539,15 +503,13 @@ pub fn flush_interval_metrics(interval_ms: u64) {
     }
 
     // Calculate and update average latencies
-    let avg_propose_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.propose_to_commit_latencies_ms);
-    let avg_batch_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.batch_ingress_to_commit_latencies_ms);
-    let avg_tx_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.tx_submit_to_commit_latencies_ms);
-    let avg_slot_latency = FlushIntervalData::calculate_avg_latency(&flush_data.slot_propose_to_execute_latencies_ms);
+    let avg_observer = FlushIntervalData::calculate_avg_latency(&flush_data.observer_latencies_ms);
+    let avg_leader = FlushIntervalData::calculate_avg_latency(&flush_data.leader_latencies_ms);
+    let avg_tx_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.tx_to_commit_latencies_ms);
 
-    PRIMARY_FLUSH_INTERVAL_LATENCY_PROPOSE_TO_COMMIT_AVG_MS.set(avg_propose_to_commit);
-    PRIMARY_FLUSH_INTERVAL_LATENCY_BATCH_TO_COMMIT_AVG_MS.set(avg_batch_to_commit);
+    PRIMARY_OBSERVER_LATENCY_AVG_MS.set(avg_observer);
+    PRIMARY_LEADER_LATENCY_AVG_MS.set(avg_leader);
     PRIMARY_FLUSH_INTERVAL_LATENCY_TX_TO_COMMIT_AVG_MS.set(avg_tx_to_commit);
-    PRIMARY_FLUSH_INTERVAL_LATENCY_SLOT_PROPOSE_TO_EXECUTE_AVG_MS.set(avg_slot_latency);
 
     // Reset for next interval
     flush_data.reset();

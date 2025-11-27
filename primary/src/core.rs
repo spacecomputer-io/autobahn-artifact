@@ -27,7 +27,8 @@ use crate::metrics::{
     PRIMARY_DAG_HEADERS_BROADCAST_TOTAL, PRIMARY_DAG_HEADERS_VOTED_ON_TOTAL,
     PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL, PRIMARY_CONSENSUS_PREPARE_VOTES_SENT_TOTAL,
     PRIMARY_CONSENSUS_CONFIRM_VOTES_SENT_TOTAL, PRIMARY_DAG_CERTIFICATE_SYNC_REQUESTS_SENT_TOTAL,
-    PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL, PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL
+    PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL, PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL,
+    record_leader_prepare_send, record_observer_prepare_receive,
 };
 use network::{CancelHandler, ReliableSender};
 use core::panic;
@@ -1032,8 +1033,10 @@ impl Core {
         debug!("Send req for Consensus message {}", consensus_message);
 
         // Metric: Track when this node sends a Prepare message (as leader)
-        if let ConsensusMessage::Prepare { .. } = &consensus_message {
+        if let ConsensusMessage::Prepare { slot, .. } = &consensus_message {
             PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL.inc();
+            // NEW: Record timestamp for leader latency tracking
+            record_leader_prepare_send(*slot);
         }
 
         let consensus_req = ConsensusRequest::new(self.name, consensus_message, &mut self.signature_service).await;
@@ -1461,6 +1464,12 @@ impl Core {
             ConsensusMessage::Prepare { slot, view: _, tc: _, qc_ticket: _, proposals,} 
             => {
                 debug!("processing prepare in slot {:?} with proposal {:?}", slot, proposals);
+                
+                // NEW: Record timestamp for observer latency tracking (only if NOT from self)
+                if author != self.name {
+                    record_observer_prepare_receive(*slot);
+                }
+                
                 if self.synchronizer.get_proposals(&consensus_message, &header).await.unwrap().is_empty() {
                     debug!("proposals of prepare in slot {:?} with proposal {:?} are not ready", slot, proposals);
                     return Ok(());

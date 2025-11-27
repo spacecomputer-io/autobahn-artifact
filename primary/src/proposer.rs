@@ -9,7 +9,7 @@ use crypto::{Digest, PublicKey, SignatureService, Hash};
 use log::{debug, info, warn, error};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
-use crate::metrics::{PRIMARY_HEADERS_PROPOSED_TOTAL, record_propose_time, PRIMARY_DAG_NODE_HEIGHT};
+use crate::metrics::{PRIMARY_HEADERS_PROPOSED_TOTAL, PRIMARY_DAG_NODE_HEIGHT};
 
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
@@ -135,7 +135,7 @@ impl Proposer {
         self.num_active_instances = 0;
       
         // Send the new header to the `Core` that will broadcast and process it.
-        record_propose_time(&header.id);
+        // Propose time tracking removed - now using slot-level latency
 
         match self.tx_core.try_send(header) {
             Ok(_) => {

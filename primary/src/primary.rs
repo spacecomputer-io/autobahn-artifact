@@ -22,7 +22,7 @@ use futures::sink::SinkExt as _;
 use log::{info, debug, warn, error};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use crate::metrics::{
-    record_batch_arrival, record_tx_submit_ms, observe_tx_submit_to_commit_latency, record_batch_size_bytes, record_tx_count,
+    record_tx_submit_ms, record_batch_size_bytes, record_tx_count,
     PRIMARY_DAG_DIGESTS_OWN_BATCHES_TOTAL, PRIMARY_DAG_DIGESTS_OTHERS_BATCHES_TOTAL
 };
 use serde::{Deserialize, Serialize};
@@ -341,14 +341,10 @@ impl MessageHandler for WorkerReceiverHandler {
             Ok(message) => match message {
                 WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes, tx_count) => {
                     PRIMARY_DAG_DIGESTS_OWN_BATCHES_TOTAL.inc();
-                    record_batch_arrival(&digest);
                     record_batch_size_bytes(&digest, batch_size_bytes);
                     record_tx_count(&digest, tx_count);
-                    if first_tx_submit_ms > 0 {
+                    if first_tx_submit_ms > 0 { 
                         record_tx_submit_ms(&digest, first_tx_submit_ms);
-                        log::debug!("PRIMARY DEBUG: Recorded OurBatch with timestamp={}, digest={:?}", first_tx_submit_ms, digest);
-                    } else {
-                        log::warn!("PRIMARY DEBUG: OurBatch has timestamp=0! digest={:?}", digest);
                     }
                     
                     // Use try_send to detect channel backpressure
@@ -370,7 +366,6 @@ impl MessageHandler for WorkerReceiverHandler {
                 },
                 WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes) => {
                     PRIMARY_DAG_DIGESTS_OTHERS_BATCHES_TOTAL.inc();
-                    record_batch_arrival(&digest);
                     record_batch_size_bytes(&digest, batch_size_bytes);
                     
                     // Use try_send to detect channel backpressure

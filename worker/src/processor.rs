@@ -88,11 +88,6 @@ impl Processor {
                 let message = match own_digest {
                     true => {
                         let ts = first_tx_at_ms.unwrap_or(0);
-                        if ts == 0 {
-                            log::warn!("PROCESSOR DEBUG: OurBatch has timestamp=0! digest={:?}", digest);
-                        } else {
-                            log::debug!("PROCESSOR DEBUG: OurBatch timestamp={}, digest={:?}", ts, digest);
-                        }
                         WorkerPrimaryMessage::OurBatch(digest, id, ts, batch_size_bytes, tx_count)
                     },
                     false => WorkerPrimaryMessage::OthersBatch(digest, id, batch_size_bytes),
