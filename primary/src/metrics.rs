@@ -16,9 +16,8 @@ pub struct FlushIntervalData {
     pub byte_count: u64,
     pub transaction_count: u64,
     
-    // NEW LATENCY METRICS (redesigned)
-    pub leader_latencies_ms: Vec<f64>,      // Leader: Prepare send → Slot execute
-    pub observer_latencies_ms: Vec<f64>,    // Observer: Prepare receive → Slot execute  
+    // LATENCY METRICS (clean & simple)
+    pub observer_latencies_ms: Vec<f64>,     // Consensus: Prepare processing → Slot execute
     pub tx_to_commit_latencies_ms: Vec<f64>, // End-to-end: TX arrival at worker → Slot execute
 }
 
@@ -29,7 +28,6 @@ impl FlushIntervalData {
             digest_count: 0,
             byte_count: 0,
             transaction_count: 0,
-            leader_latencies_ms: Vec::new(),
             observer_latencies_ms: Vec::new(),
             tx_to_commit_latencies_ms: Vec::new(),
         }
@@ -40,7 +38,6 @@ impl FlushIntervalData {
         self.digest_count = 0;
         self.byte_count = 0;
         self.transaction_count = 0;
-        self.leader_latencies_ms.clear();
         self.observer_latencies_ms.clear();
         self.tx_to_commit_latencies_ms.clear();
     }
@@ -327,18 +324,12 @@ lazy_static! {
     // LATENCY GAUGES - Flush Interval Averages (NEW CLEAN METRICS)
     // ============================================================================
 
-    // NEW CLEAN LATENCY METRICS
+    // OBSERVER CONSENSUS LATENCY METRIC
     pub static ref PRIMARY_OBSERVER_LATENCY_AVG_MS: Gauge =
         register_gauge!(
             "primary_observer_latency_avg_ms",
-            "Average consensus latency when NOT leader: Prepare receive → Slot execute (ms)"
+            "Average observer consensus latency: Prepare receive → Slot execute (ms)"
         ).expect("failed to register primary_observer_latency_avg_ms");
-
-    pub static ref PRIMARY_LEADER_LATENCY_AVG_MS: Gauge =
-        register_gauge!(
-            "primary_leader_latency_avg_ms",
-            "Average consensus latency when IS leader: Prepare send → Slot execute (ms)"
-        ).expect("failed to register primary_leader_latency_avg_ms");
 
     pub static ref PRIMARY_FLUSH_INTERVAL_LATENCY_TX_TO_COMMIT_AVG_MS: Gauge =
         register_gauge!(
@@ -382,7 +373,7 @@ lazy_static! {
     // ============================================================================
 
     // Slot-level latency tracking (NEW)
-    static ref SLOT_PREPARE_TIMES: Mutex<HashMap<u64, (Instant, bool)>> = Mutex::new(HashMap::new()); // slot → (timestamp, is_leader)
+    static ref SLOT_PREPARE_TIMES: Mutex<HashMap<u64, Instant>> = Mutex::new(HashMap::new()); // slot → timestamp
     
     // TX-level latency tracking (KEEP EXISTING)
     static ref SUBMIT_MS_BY_BATCH: Mutex<HashMap<Digest, u64>> = Mutex::new(HashMap::new());
@@ -399,32 +390,24 @@ lazy_static! {
 // Helper Functions - Latency Tracking (Now in Milliseconds)
 // ============================================================================
 
-/// Record when this node sends a Prepare message AS LEADER
-pub fn record_leader_prepare_send(slot: u64) {
-    let mut map = SLOT_PREPARE_TIMES.lock().unwrap();
-    map.insert(slot, (Instant::now(), true)); // true = is_leader
-}
-
-/// Record when this node receives a Prepare message AS OBSERVER
+/// Record timestamp when observer receives Prepare message from leader
+/// Only called when receiving Prepare from ANOTHER node (not self)
 pub fn record_observer_prepare_receive(slot: u64) {
     let mut map = SLOT_PREPARE_TIMES.lock().unwrap();
     // Only record if not already recorded (avoid duplicate receives)
-    map.entry(slot).or_insert((Instant::now(), false)); // false = is_observer
+    map.entry(slot).or_insert(Instant::now());
 }
 
-/// Calculate latency for a slot execution (called from committer)
+/// Calculate observer latency for a slot execution (called from committer)
+/// Measures: Prepare receive → Slot execution (observer perspective only)
 pub fn observe_slot_latency(slot: u64) {
     let mut map = SLOT_PREPARE_TIMES.lock().unwrap();
-    if let Some((start_time, is_leader)) = map.remove(&slot) {
+    if let Some(start_time) = map.remove(&slot) {
         let latency_ms = start_time.elapsed().as_millis() as f64;
         
-        // Add to appropriate bucket based on whether we were leader or observer
+        // Store observer latency
         let mut flush_data = FLUSH_INTERVAL_DATA.lock().unwrap();
-        if is_leader {
-            flush_data.leader_latencies_ms.push(latency_ms);
-        } else {
-            flush_data.observer_latencies_ms.push(latency_ms);
-        }
+        flush_data.observer_latencies_ms.push(latency_ms);
     }
 }
 
@@ -504,11 +487,9 @@ pub fn flush_interval_metrics(interval_ms: u64) {
 
     // Calculate and update average latencies
     let avg_observer = FlushIntervalData::calculate_avg_latency(&flush_data.observer_latencies_ms);
-    let avg_leader = FlushIntervalData::calculate_avg_latency(&flush_data.leader_latencies_ms);
     let avg_tx_to_commit = FlushIntervalData::calculate_avg_latency(&flush_data.tx_to_commit_latencies_ms);
 
     PRIMARY_OBSERVER_LATENCY_AVG_MS.set(avg_observer);
-    PRIMARY_LEADER_LATENCY_AVG_MS.set(avg_leader);
     PRIMARY_FLUSH_INTERVAL_LATENCY_TX_TO_COMMIT_AVG_MS.set(avg_tx_to_commit);
 
     // Reset for next interval

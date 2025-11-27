@@ -230,8 +230,9 @@ impl Committer {
                             PRIMARY_SLOT_EXECUTION_LATENCY.observe(slot_elapsed_ms);
                             PRIMARY_SLOTS_EXECUTED_TOTAL.inc();
                             
-                            // NEW: Record slot-level latency (observer or leader)
-                            observe_slot_latency(state.last_executed_slot + 1);
+                            // Record slot-level latency (Prepare processing → Slot execution)
+                            let executed_slot = state.last_executed_slot + 1;
+                            observe_slot_latency(executed_slot);
                             
                             // Record TX latencies for all digests in the slot
                             for digest in all_digests_in_slot.iter() {

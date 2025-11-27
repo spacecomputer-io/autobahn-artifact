@@ -28,7 +28,7 @@ use crate::metrics::{
     PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL, PRIMARY_CONSENSUS_PREPARE_VOTES_SENT_TOTAL,
     PRIMARY_CONSENSUS_CONFIRM_VOTES_SENT_TOTAL, PRIMARY_DAG_CERTIFICATE_SYNC_REQUESTS_SENT_TOTAL,
     PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL, PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL,
-    record_leader_prepare_send, record_observer_prepare_receive,
+    record_observer_prepare_receive,
 };
 use network::{CancelHandler, ReliableSender};
 use core::panic;
@@ -1035,8 +1035,9 @@ impl Core {
         // Metric: Track when this node sends a Prepare message (as leader)
         if let ConsensusMessage::Prepare { slot, .. } = &consensus_message {
             PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL.inc();
-            // NEW: Record timestamp for leader latency tracking
-            record_leader_prepare_send(*slot);
+            // NOTE: We DON'T record leader latency here because the leader immediately
+            // processes its own Prepare locally (line 1061), which bypasses network delay.
+            // Leader latency will be recorded when we start collecting votes instead.
         }
 
         let consensus_req = ConsensusRequest::new(self.name, consensus_message, &mut self.signature_service).await;
@@ -1465,7 +1466,7 @@ impl Core {
             => {
                 debug!("processing prepare in slot {:?} with proposal {:?}", slot, proposals);
                 
-                // NEW: Record timestamp for observer latency tracking (only if NOT from self)
+                // Record timestamp for observer latency (only when receiving from another node)
                 if author != self.name {
                     record_observer_prepare_receive(*slot);
                 }
