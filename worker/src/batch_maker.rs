@@ -10,10 +10,10 @@ use crypto::PublicKey;
 #[cfg(feature = "benchmark")]
 use ed25519_dalek::{Digest as _, Sha512};
 use log::{debug, info, warn};
-use network::{ReliableSender, SimpleSender};
+use network::SimpleSender;
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 use crate::metrics::{WORKER_BATCHES_SEALED_TOTAL, WORKER_BATCH_SIZE_BYTES};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,14 +46,12 @@ pub struct BatchMaker {
     current_batch: Batch,
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
-    /// A network sender to broadcast the batches to the other workers.
-    network: SimpleSender,
+    /// Channel to the background broadcast task (best-effort, never blocks BatchMaker).
+    tx_broadcast: Sender<(Vec<SocketAddr>, Bytes)>,
     /// Timestamp in ms of the first tx received for the currently building batch (if any).
     first_tx_submit_ms: Option<u64>,
-    /// Performance tracking for network broadcasts
-    total_broadcast_time_ms: u64,
-    broadcast_count: u64,
-    slow_broadcasts: u64,
+    /// Count of batches dropped from the broadcast channel (channel full = extreme congestion).
+    broadcast_dropped: u64,
 }
 
 impl BatchMaker {
@@ -65,21 +63,30 @@ impl BatchMaker {
         tx_batch: Sender<SerializedBatchMessage>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
+        // Spawn a dedicated background task for best-effort batch broadcast.
+        // This decouples the broadcast from seal(), so BatchMaker is never blocked
+        // by TCP backpressure when sending to the other workers.
+        let (tx_broadcast, mut rx_broadcast) = channel::<(Vec<SocketAddr>, Bytes)>(10_000);
+        tokio::spawn(async move {
+            let mut network = SimpleSender::new();
+            while let Some((addresses, bytes)) = rx_broadcast.recv().await {
+                network.broadcast(addresses, bytes).await;
+            }
+        });
+
         tokio::spawn(async move {
             Self {
                 batch_size,
                 max_batch_delay,
                 rx_transaction,
                 //tx_message, //previously forwarded batch to Quorum_waiter; now skipping this step.
-                tx_batch,  
+                tx_batch,
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
-                network: SimpleSender::new(),
+                tx_broadcast,
                 first_tx_submit_ms: None,
-                total_broadcast_time_ms: 0,
-                broadcast_count: 0,
-                slow_broadcasts: 0,
+                broadcast_dropped: 0,
             }
             .run()
             .await;
@@ -156,14 +163,11 @@ impl BatchMaker {
                           rx_usage_pct, self.rx_transaction.len(), self.rx_transaction.capacity());
                 }
                 
-                // Network broadcast performance
-                if self.broadcast_count > 0 {
-                    let avg_broadcast_ms = self.total_broadcast_time_ms as f64 / self.broadcast_count as f64;
-                    info!("BatchMaker NETWORK: {} broadcasts, avg {:.2}ms, {} slow (>20ms)",
-                          self.broadcast_count, avg_broadcast_ms, self.slow_broadcasts);
-                    self.total_broadcast_time_ms = 0;
-                    self.broadcast_count = 0;
-                    self.slow_broadcasts = 0;
+                // Broadcast channel health — Sender doesn't expose len(), so we track drops.
+                if self.broadcast_dropped > 0 {
+                    warn!("BatchMaker NETWORK: {} broadcast(s) dropped this period (broadcast channel full - extreme congestion)",
+                          self.broadcast_dropped);
+                    self.broadcast_dropped = 0;
                 }
                 
                 tx_count = 0;
@@ -218,31 +222,25 @@ impl BatchMaker {
         // NOTE: Removed individual batch size logging - now using aggregate stats
         }
 
-        // Broadcast the batch through the network.
-
-        //NEW:
-        //Best-effort broadcast only. Any failure is correlated with the primary operating this node (running on same machine)
-        let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
-        let bytes = Bytes::from(serialized.clone());
-        
-        // Measure broadcast latency
-        let broadcast_start = Instant::now();
-        self.network.broadcast(addresses, bytes).await; 
-        let broadcast_elapsed_ms = broadcast_start.elapsed().as_millis() as u64;
-        
-        // Track broadcast performance
-        self.broadcast_count += 1;
-        self.total_broadcast_time_ms += broadcast_elapsed_ms;
-        if broadcast_elapsed_ms > 20 {
-            self.slow_broadcasts += 1;
-            log::warn!("BatchMaker: Slow broadcast took {}ms to {} workers", 
-                      broadcast_elapsed_ms, self.workers_addresses.len());
-        } 
-
+        // Deliver the batch to our own primary immediately — not gated on broadcast.
+        // The primary will include this digest in the next header. Other nodes that
+        // don't yet have the batch data will sync it via the normal sync mechanism.
         let submit_ms = self.first_tx_submit_ms.take();
-        self.tx_batch.send((serialized, submit_ms, tx_count)).await.expect("Failed to deliver batch");
+        self.tx_batch.send((serialized.clone(), submit_ms, tx_count)).await.expect("Failed to deliver batch");
         WORKER_BATCHES_SEALED_TOTAL.inc();
         WORKER_BATCH_SIZE_BYTES.set(sealed_size as i64);
+
+        // Enqueue best-effort broadcast to the background task.
+        // Uses try_send so BatchMaker is NEVER blocked by TCP backpressure.
+        // If the channel is full (extreme congestion), the broadcast is dropped;
+        // other nodes will recover the batch via the sync protocol.
+        let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
+        let bytes = Bytes::from(serialized);
+        if self.tx_broadcast.try_send((addresses, bytes)).is_err() {
+            self.broadcast_dropped += 1;
+            warn!("BatchMaker: broadcast channel full, dropping batch broadcast (best-effort, {} dropped total)",
+                  self.broadcast_dropped);
+        }
 
         //OLD:
         //This uses reliable sender. The receiver worker will reply with an ack. The Reply Handler is passed to Quorum Waiter.
