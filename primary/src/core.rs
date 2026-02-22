@@ -1755,33 +1755,51 @@ impl Core {
 
     #[async_recursion]
     async fn clean_slot(&mut self, slot: Slot) -> DagResult<()> {
-
-        //GC Consensus instances
-        self.consensus_instances.retain(|(s, _), _| s != &slot); 
-        self.consensus_cancel_handlers.retain(|s, _| s != &slot); 
-
-        //GC QC_Makers
-        self.qc_makers.retain(|(s, _), _| s != &slot); 
-        // self.pqc_makers.retain(|(s, _), _| s != &sl); 
-        // self.cqc_makers.retain(|(s, _), _| s != &sl); 
+        self.consensus_instances.retain(|(s, _), _| s != &slot);
+        self.consensus_cancel_handlers.retain(|s, _| s != &slot);
+        self.qc_makers.retain(|(s, _), _| s != &slot);
+        self.tc_makers.retain(|(s, _), _| s != &slot);
+        self.high_proposals.retain(|s, _| s != &slot);
+        self.high_qcs.retain(|s, _| s != &slot);
+        self.views.retain(|s, _| s != &slot);
+        self.last_voted_consensus.retain(|(s, _)| s != &slot);
+        self.already_proposed_slots.retain(|s| s != &slot);
         Ok(())
     }
 
     #[async_recursion]
     async fn clean_slot_periods(&mut self, slot: Slot) -> DagResult<()> {
-
-        //slot periodics
         let slot_period = slot % self.k;
         let k = self.k;
 
-        //GC Consensus instances
-        self.consensus_instances.retain(|(s, _), _| s % k != slot_period && s <= &slot); 
-        self.consensus_cancel_handlers.retain(|s, _| s % k != slot_period && s <= &slot); 
-        //self.committed_slots GC those that are older.
+        // FIXED: the original condition `s % k != slot_period && s <= &slot` used AND logic,
+        // which accidentally removed data for all future slots (s > slot), including currently
+        // active concurrent slots. The correct condition uses OR: keep an entry if it belongs
+        // to a future slot (not yet committed) OR to a different periodic group (different k-period).
+        // Only entries that are both (a) in the same k-period as the just-committed slot AND
+        // (b) at or before the committed slot index are removed.
 
-        //GC QC_Makers
-        self.qc_makers.retain(|(s, _), _| s % k != slot_period && s <= &slot); 
-     
+        // GC consensus instances and cancel handlers
+        self.consensus_instances.retain(|(s, _), _| *s > slot || s % k != slot_period);
+        self.consensus_cancel_handlers.retain(|s, _| *s > slot || s % k != slot_period);
+
+        // GC QC makers (consensus vote aggregation state)
+        self.qc_makers.retain(|(s, _), _| *s > slot || s % k != slot_period);
+
+        // GC TC makers (timeout certificate aggregation state).
+        // NOTE: Previously tc_makers was never cleaned up at all, causing unbounded growth
+        // as every new (slot, view) pair on timeout created a permanent entry. This was the
+        // primary driver of event-loop starvation under high latency.
+        self.tc_makers.retain(|(s, _), _| *s > slot || s % k != slot_period);
+
+        // GC per-slot proposal and QC state
+        self.high_proposals.retain(|s, _| *s > slot || s % k != slot_period);
+        self.high_qcs.retain(|s, _| *s > slot || s % k != slot_period);
+
+        // GC per-slot view tracking and vote deduplication state
+        self.views.retain(|s, _| *s > slot || s % k != slot_period);
+        self.last_voted_consensus.retain(|(s, _)| *s > slot || s % k != slot_period);
+        self.already_proposed_slots.retain(|s| *s > slot || s % k != slot_period);
 
         Ok(())
     }
