@@ -73,6 +73,37 @@ impl SimpleSender {
         }
     }
 
+    /// Non-blocking best-effort broadcast: enqueue the message to each peer's channel
+    /// without waiting. If a peer's channel is full (backpressure), the send to that
+    /// peer is silently dropped — the caller must rely on sync/recovery for missed data.
+    /// This is intended for batch data broadcast where the sync protocol handles gaps.
+    pub fn broadcast_best_effort(&mut self, addresses: Vec<SocketAddr>, data: Bytes) -> usize {
+        let mut dropped = 0;
+        for address in addresses {
+            NETWORK_MESSAGES_TOTAL.with_label_values(&["send"]).inc();
+            if let Some(tx) = self.connections.get(&address) {
+                match tx.try_send(data.clone()) {
+                    Ok(()) => continue,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        dropped += 1;
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        // Connection died — spawn a fresh one and try once
+                    }
+                }
+            }
+            // No existing connection or it was closed — spawn a new one
+            let tx = Self::spawn_connection(address);
+            if tx.try_send(data.clone()).is_err() {
+                dropped += 1;
+            } else {
+                self.connections.insert(address, tx);
+            }
+        }
+        dropped
+    }
+
     /// Pick a few addresses at random (specified by `nodes`) and try (best-effort) to send the
     /// message only to them. This is useful to pick nodes with whom to sync.
     pub async fn lucky_broadcast(

@@ -66,11 +66,23 @@ impl BatchMaker {
         // Spawn a dedicated background task for best-effort batch broadcast.
         // This decouples the broadcast from seal(), so BatchMaker is never blocked
         // by TCP backpressure when sending to the other workers.
+        //
+        // Uses broadcast_best_effort() which is fully non-blocking: if a peer's
+        // per-connection channel (cap 1000) is full, that peer's send is dropped.
+        // The sync protocol recovers any missed batches.  This prevents the
+        // background task from stalling on a single slow peer and backing up the
+        // entire broadcast queue.
         let (tx_broadcast, mut rx_broadcast) = channel::<(Vec<SocketAddr>, Bytes)>(10_000);
         tokio::spawn(async move {
             let mut network = SimpleSender::new();
+            let mut total_peer_drops: u64 = 0;
             while let Some((addresses, bytes)) = rx_broadcast.recv().await {
-                network.broadcast(addresses, bytes).await;
+                let dropped = network.broadcast_best_effort(addresses, bytes);
+                if dropped > 0 {
+                    total_peer_drops += dropped as u64;
+                    debug!("Broadcast task: {} peer-channel drops this batch ({} total)",
+                           dropped, total_peer_drops);
+                }
             }
         });
 

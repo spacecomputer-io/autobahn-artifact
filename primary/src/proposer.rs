@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header, ConsensusMessage};
@@ -14,6 +14,14 @@ use crate::metrics::{PRIMARY_HEADERS_PROPOSED_TOTAL, PRIMARY_DAG_NODE_HEIGHT};
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
 pub mod proposer_tests;
+
+/// Maximum number of batch digests to include in a single header.
+/// This prevents runaway header growth when the proposer is blocked waiting
+/// for a parent certificate: without this cap, digests accumulate unboundedly
+/// and a single header can reach megabytes (e.g. 47,291 digests = 1.51 MB),
+/// which peers cannot sync/certify in time.  Remaining digests are kept in
+/// the queue and included in subsequent headers.
+const MAX_HEADER_DIGESTS: usize = 1_000;
 
 /// The proposer creates new headers and send them to the core for broadcasting and further processing.
 pub struct Proposer {
@@ -100,17 +108,29 @@ impl Proposer {
     }
     
     async fn make_header(&mut self) {
-        // Make a new header.
-        let num_batches = self.digests.len();
+        // Bound the number of digests per header to prevent runaway growth.
+        // When the proposer is blocked waiting for a parent certificate, digests
+        // accumulate. Without a cap, a single header can contain tens of thousands
+        // of digests that peers cannot sync in time. Remaining digests stay in
+        // self.digests and are included in subsequent headers.
+        let take = self.digests.len().min(MAX_HEADER_DIGESTS);
+        let included: BTreeMap<_, _> = self.digests.drain(..take).collect();
+        let num_batches = included.len();
+        let remaining = self.digests.len();
         let num_consensus_msgs = self.consensus_instances.len();
-        
-        debug!("Creating header at height {} with {} batches, {} consensus instances", 
+
+        if remaining > 0 {
+            warn!("PROPOSER: Header at height {} capped at {} digests ({} remaining for next header)",
+                  self.height, num_batches, remaining);
+        }
+
+        debug!("Creating header at height {} with {} batches, {} consensus instances",
                self.height, num_batches, num_consensus_msgs);
 
         let mut header = Header::new(
                 self.name,
                 self.height,
-                self.digests.drain(..).collect(),
+                included,
                 self.last_parent.clone().unwrap(),
                 &mut self.signature_service,
                 self.consensus_instances.clone(),
@@ -194,11 +214,14 @@ impl Proposer {
                        self.height, elapsed, self.is_special);
                 current_time = Instant::now();
                 
-                // Make a new header.
-                batches_included += self.digests.len() as u64;
+                // Make a new header (may only include up to MAX_HEADER_DIGESTS).
+                let pre_drain_count = self.digests.len();
                 self.make_header().await;
+                let included_count = pre_drain_count - self.digests.len();
+                batches_included += included_count as u64;
                 headers_proposed += 1;
-                self.payload_size = 0;
+                // Recompute payload_size from remaining digests (each is 32 bytes).
+                self.payload_size = self.digests.iter().map(|(d, _)| d.size()).sum();
                 
                 // Reset wait timers
                 waiting_for_parent_since = None;
