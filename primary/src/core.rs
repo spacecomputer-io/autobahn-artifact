@@ -20,14 +20,15 @@ use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use log::{debug, error, warn, info};
 use crate::metrics::{
-    PRIMARY_TIMEOUTS_TOTAL, PRIMARY_TIMEOUTS_AS_LEADER_TOTAL,
-    PRIMARY_VOTES_SENT_TOTAL, PRIMARY_VOTES_RECEIVED_TOTAL, PRIMARY_VOTES_REFUSED_TOTAL,
-    PRIMARY_CONSENSUS_VIEW_CHANGES_TOTAL, PRIMARY_CONSENSUS_LEADER_CHANGES_TOTAL,
-    PRIMARY_HEADER_SYNC_REQUESTS_SENT_TOTAL,
-    PRIMARY_DAG_HEADERS_BROADCAST_TOTAL, PRIMARY_DAG_HEADERS_VOTED_ON_TOTAL,
-    PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL, PRIMARY_CONSENSUS_PREPARE_VOTES_SENT_TOTAL,
-    PRIMARY_CONSENSUS_CONFIRM_VOTES_SENT_TOTAL, PRIMARY_DAG_CERTIFICATE_SYNC_REQUESTS_SENT_TOTAL,
-    PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL, PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL,
+    CONSENSUS_TIMEOUTS_TOTAL, CONSENSUS_TIMEOUTS_AS_LEADER_TOTAL,
+    CONSENSUS_VOTES_SENT_TOTAL, CONSENSUS_VOTES_RECEIVED_TOTAL, CONSENSUS_VOTES_REFUSED_TOTAL,
+    CONSENSUS_VIEW_CHANGES_TOTAL, CONSENSUS_LEADER_CHANGES_TOTAL,
+    DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL,
+    DISSEMINATION_HEADERS_BROADCAST_TOTAL, DISSEMINATION_HEADERS_VOTED_ON_TOTAL,
+    CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL, CONSENSUS_PREPARE_VOTES_SENT_TOTAL,
+    CONSENSUS_CONFIRM_VOTES_SENT_TOTAL, DISSEMINATION_CERT_SYNC_REQUESTS_SENT_TOTAL,
+    CONSENSUS_FAST_PATH_COMMITS_TOTAL, CONSENSUS_SLOW_PATH_COMMITS_TOTAL,
+    CONSENSUS_CURRENT_VIEW,
     record_observer_prepare_receive,
 };
 use network::{CancelHandler, ReliableSender};
@@ -315,7 +316,7 @@ impl Core {
             .extend(handlers);
         
         // Metric: header broadcast to other primaries
-        PRIMARY_DAG_HEADERS_BROADCAST_TOTAL.inc();
+        DISSEMINATION_HEADERS_BROADCAST_TOTAL.inc();
 
         // Process the header.
         self.process_header(header, false).await
@@ -355,7 +356,7 @@ impl Core {
         if self.synchronizer.missing_payload(&header, sync).await? {
             //println!("Missing payload");
             debug!("Processing of {} suspended: missing payload", header);
-            PRIMARY_VOTES_REFUSED_TOTAL.with_label_values(&["missing_payload"]).inc();
+            CONSENSUS_VOTES_REFUSED_TOTAL.with_label_values(&["missing_payload"]).inc();
             return Ok(());
         }
 
@@ -368,7 +369,7 @@ impl Core {
         {
             //println!("The parent is missing");
             debug!("The parent is missing, suspending processing");
-            PRIMARY_VOTES_REFUSED_TOTAL.with_label_values(&["missing_parent"]).inc();
+            CONSENSUS_VOTES_REFUSED_TOTAL.with_label_values(&["missing_parent"]).inc();
             return Ok(());
         }
 
@@ -384,7 +385,7 @@ impl Core {
             // TODO: Use reputation
             //println!("Need to sync on missing tips, reschedule");
             debug!("Can't vote for prepare, need to sync on missing tips, suspending processing");
-            PRIMARY_VOTES_REFUSED_TOTAL.with_label_values(&["wrong_view"]).inc();
+            CONSENSUS_VOTES_REFUSED_TOTAL.with_label_values(&["wrong_view"]).inc();
             return Ok(());
         }
 
@@ -457,7 +458,7 @@ impl Core {
         {
             // Metric: voted on a header from another primary
             if header.author != self.name {
-                PRIMARY_DAG_HEADERS_VOTED_ON_TOTAL.inc();
+                DISSEMINATION_HEADERS_VOTED_ON_TOTAL.inc();
             }
             
             //println!("voting for header");
@@ -499,7 +500,7 @@ impl Core {
             } else {
                 "header" // Pure header vote with no consensus votes
             };
-            PRIMARY_VOTES_SENT_TOTAL.with_label_values(&[vote_type]).inc();
+            CONSENSUS_VOTES_SENT_TOTAL.with_label_values(&[vote_type]).inc();
 
             if vote.origin == self.name {
                 self.process_vote(vote, false)
@@ -602,7 +603,7 @@ impl Core {
             } else {
                 "header"
             };
-            PRIMARY_VOTES_RECEIVED_TOTAL.with_label_values(&[vote_type]).inc();
+            CONSENSUS_VOTES_RECEIVED_TOTAL.with_label_values(&[vote_type]).inc();
         }
 
         // NOTE: If sending externally then need map of open consensus instances
@@ -743,7 +744,7 @@ impl Core {
                             let new_consensus_message = match qc_maker.try_fast {
                                 true => {
                                     debug!("taking fast path!");
-                                    PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
+                                    CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
                                     ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                     }, // Create Commit if we have FastPrepareQC
                                 false => ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() },
@@ -759,7 +760,7 @@ impl Core {
                         ConsensusMessage::Confirm {slot, view, qc: _,proposals,}
                         => {
                             debug!("Commit QC formed in slot {:?}", slot);
-                            PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL.inc();
+                            CONSENSUS_SLOW_PATH_COMMITS_TOTAL.inc();
                             let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
                             // Send this new instance to the proposer
@@ -940,7 +941,7 @@ impl Core {
                         let new_consensus_message = match qc_maker.try_fast {
                             true => {
                                 debug!("taking fast path!");
-                                PRIMARY_CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
+                                CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
                                 ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                 }, // Create Commit if we have FastPrepareQC
                             false => ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() },
@@ -953,7 +954,7 @@ impl Core {
                     ConsensusMessage::Confirm {slot, view, qc: _,proposals,}
                     => {
                         debug!("Commit QC formed in slot {:?}", slot);
-                        PRIMARY_CONSENSUS_SLOW_PATH_COMMITS_TOTAL.inc();
+                        CONSENSUS_SLOW_PATH_COMMITS_TOTAL.inc();
                         let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
                         // continue with next consensus phase
@@ -1034,7 +1035,7 @@ impl Core {
 
         // Metric: Track when this node sends a Prepare message (as leader)
         if let ConsensusMessage::Prepare { slot, .. } = &consensus_message {
-            PRIMARY_CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL.inc();
+            CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL.inc();
             // NOTE: We DON'T record leader latency here because the leader immediately
             // processes its own Prepare locally (line 1061), which bypasses network delay.
             // Leader latency will be recorded when we start collecting votes instead.
@@ -1608,7 +1609,7 @@ impl Core {
                     .await;
                 consensus_sigs.push((*slot, prepare_message.digest(), sig));
                 // Metric: Prepare vote sent
-                PRIMARY_CONSENSUS_PREPARE_VOTES_SENT_TOTAL.inc();
+                CONSENSUS_PREPARE_VOTES_SENT_TOTAL.inc();
                 debug!("Prepare-Vote for slot: {}, view: {},has digest: {}", slot, view, prepare_message.digest());
             }
             _ => {}
@@ -1640,7 +1641,7 @@ impl Core {
                     .await;
                 consensus_sigs.push((*slot, confirm_message.digest(), sig));
                 // Metric: Confirm vote sent
-                PRIMARY_CONSENSUS_CONFIRM_VOTES_SENT_TOTAL.inc();
+                CONSENSUS_CONFIRM_VOTES_SENT_TOTAL.inc();
                 debug!("Confirm-Vote for slot: {}, view: {}, qc_dig {:?} -> has digest: {}", slot, view, qc.id , confirm_message.digest());
             }
             _ => {}
@@ -1889,9 +1890,9 @@ impl Core {
     async fn local_timeout_round(&mut self, slot: Slot, view: View) -> DagResult<()> {
         // Using warn! only for actionable timeouts; otherwise we mark as OBSOLETE and keep at debug level.
         warn!("Timeout fired for slot {}, view {} (pending evaluation)", slot, view);
-        PRIMARY_TIMEOUTS_TOTAL.inc();
+        CONSENSUS_TIMEOUTS_TOTAL.inc();
         let leader = self.leader_elector.get_leader(slot, view);
-        if leader == self.name { PRIMARY_TIMEOUTS_AS_LEADER_TOTAL.inc(); }
+        if leader == self.name { CONSENSUS_TIMEOUTS_AS_LEADER_TOTAL.inc(); }
         //println!("timeout was triggered");
 
         //If timer was cancelled, ignore  -- Note: technically redundant with commit check below, but currently we do not insert CommitQC's... TODO: Need to insert these so we can avoid joining view change and just reply.
@@ -2005,17 +2006,20 @@ impl Core {
             debug!("Assembled TimeoutCertificate {:?}", tc);
 
             // Track view change (successful timeout with TC formed)
-            PRIMARY_CONSENSUS_VIEW_CHANGES_TOTAL.inc();
+            CONSENSUS_VIEW_CHANGES_TOTAL.inc();
 
             // Check if leader changed
             let old_leader = self.leader_elector.get_leader(timeout.slot, timeout.view);
             let new_leader = self.leader_elector.get_leader(timeout.slot, timeout.view + 1);
             if old_leader != new_leader {
-                PRIMARY_CONSENSUS_LEADER_CHANGES_TOTAL.inc();
+                CONSENSUS_LEADER_CHANGES_TOTAL.inc();
             }
 
             // Try to advance the view
             self.views.insert(timeout.slot, timeout.view + 1);
+
+            // Update view gauge
+            CONSENSUS_CURRENT_VIEW.set((timeout.view + 1) as i64);
 
             // Start the new view timer
             let timer = Timer::new(tc.slot, tc.view + 1, self.timeout_delay);

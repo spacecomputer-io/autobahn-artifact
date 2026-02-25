@@ -15,7 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::metrics::{PRIMARY_COMMITS_TOTAL, PRIMARY_SLOTS_EXECUTED_TOTAL, PRIMARY_SLOT_EXECUTION_LATENCY, PRIMARY_PENDING_SLOTS, PRIMARY_DAG_HEIGHT, PRIMARY_SLOT_HEADERS_BY_NODE, PRIMARY_SLOT_BYTES_BY_NODE, PRIMARY_SLOT_DIGESTS_BY_NODE, PRIMARY_ACTIVE_NODES_IN_SLOT, observe_slot_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, take_tx_count, record_flush_interval_commit};
+use crate::metrics::{DISSEMINATION_HEADERS_COMMITTED_TOTAL, CONSENSUS_SLOTS_EXECUTED_TOTAL, CONSENSUS_SLOT_EXECUTION_LATENCY, CONSENSUS_PENDING_SLOTS, DISSEMINATION_DAG_HEIGHT, CONSENSUS_HEADERS_BY_NODE, CONSENSUS_BYTES_BY_NODE, CONSENSUS_DIGESTS_BY_NODE, CONSENSUS_ACTIVE_NODES_IN_SLOT, CONSENSUS_CURRENT_SLOT, observe_slot_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, take_tx_count, record_flush_interval_commit};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -63,7 +63,7 @@ impl State {
         self.last_committed_round = last_committed_round;
         
         // Update DAG height metric
-        PRIMARY_DAG_HEIGHT.set(last_committed_round as i64);
+        DISSEMINATION_DAG_HEIGHT.set(last_committed_round as i64);
 
         for (name, round) in &self.last_executed_heights {
             self.dag.retain(|r, authorities| {
@@ -76,6 +76,7 @@ impl State {
 
 pub struct Committer {
     gc_depth: Height,
+    committee_size: usize,
     rx_mempool: Receiver<Certificate>,
     rx_deliver: Receiver<Certificate>,
     rx_commit_message: Receiver<ConsensusMessage>,
@@ -95,6 +96,7 @@ impl Committer {
         tx_output: Sender<Header>,
         synchronizer: Synchronizer,
     ) {
+        let committee_size = committee.size();
         let (tx_deliver, rx_deliver) = channel(CHANNEL_CAPACITY);
 
         let genesis = Certificate::genesis(&committee);
@@ -106,6 +108,7 @@ impl Committer {
         tokio::spawn(async move {
             Self {
                 gc_depth,
+                committee_size,
                 rx_mempool,
                 rx_deliver,
                 rx_commit_message,
@@ -120,7 +123,7 @@ impl Committer {
 
     async fn process_commit_message(&mut self, state: &mut State, commit_message: ConsensusMessage) {
         match commit_message.clone() {
-            ConsensusMessage::Commit{slot, view: _, qc: _, proposals: _} => {
+            ConsensusMessage::Commit{slot, view: _, qc, proposals: _} => {
                 if slot <= state.last_executed_slot {
                     debug!("Already committed slot {}", slot);
                     return;
@@ -131,7 +134,7 @@ impl Committer {
                 let pending_slots = state.log.len();
                 
                 // Update Prometheus gauge BEFORE executing slots (to capture peak backlog)
-                PRIMARY_PENDING_SLOTS.set(pending_slots as i64);
+                CONSENSUS_PENDING_SLOTS.set(pending_slots as i64);
                 
                 // Warn if too many slots are pending
                 if pending_slots > 100 {
@@ -182,7 +185,7 @@ impl Committer {
                                     // Track per-node contribution
                                     active_nodes.insert(header.author);
                                     let author_str = format!("{}", header.author);
-                                    PRIMARY_SLOT_HEADERS_BY_NODE.with_label_values(&[&author_str]).inc();
+                                    CONSENSUS_HEADERS_BY_NODE.with_label_values(&[&author_str]).inc();
                                     
                                     info!("Committed {}", header);
                                     #[cfg(feature = "benchmark")]
@@ -195,7 +198,7 @@ impl Committer {
                                     if let Err(e) = self.tx_output.send(header.clone()).await {
                                         debug!("Failed to send block through the output channel: {}", e);
                                     }
-                                    PRIMARY_COMMITS_TOTAL.inc();
+                                    DISSEMINATION_HEADERS_COMMITTED_TOTAL.inc();
                                     
                                     // Collect bytes and transactions for this header
                                     let mut total_bytes: u64 = 0;
@@ -210,8 +213,8 @@ impl Committer {
                                     }
                                     
                                     // Track per-node bytes and digests
-                                    PRIMARY_SLOT_BYTES_BY_NODE.with_label_values(&[&author_str]).inc_by(total_bytes);
-                                    PRIMARY_SLOT_DIGESTS_BY_NODE.with_label_values(&[&author_str]).inc_by(num_digests as u64);
+                                    CONSENSUS_BYTES_BY_NODE.with_label_values(&[&author_str]).inc_by(total_bytes);
+                                    CONSENSUS_DIGESTS_BY_NODE.with_label_values(&[&author_str]).inc_by(num_digests as u64);
                                     
                                     // Record data for flush interval metrics
                                     record_flush_interval_commit(num_digests, total_bytes, total_transactions);
@@ -221,18 +224,22 @@ impl Committer {
                             }
                             
                             // Record how many unique nodes contributed to this slot
-                            PRIMARY_ACTIVE_NODES_IN_SLOT.set(active_nodes.len() as i64);
+                            CONSENSUS_ACTIVE_NODES_IN_SLOT.set(active_nodes.len() as i64);
                             
                             let slot_elapsed = slot_start_time.elapsed();
                             let slot_elapsed_ms = slot_elapsed.as_millis() as f64;
                             
                             // Record slot execution metrics
-                            PRIMARY_SLOT_EXECUTION_LATENCY.observe(slot_elapsed_ms);
-                            PRIMARY_SLOTS_EXECUTED_TOTAL.inc();
+                            CONSENSUS_SLOT_EXECUTION_LATENCY.observe(slot_elapsed_ms);
+                            CONSENSUS_SLOTS_EXECUTED_TOTAL.inc();
                             
                             // Record slot-level latency (Prepare processing → Slot execution)
                             let executed_slot = state.last_executed_slot + 1;
-                            observe_slot_latency(executed_slot);
+                            let path = if qc.votes.len() == self.committee_size { "fast" } else { "slow" };
+                            observe_slot_latency(executed_slot, path);
+
+                            // Update current slot gauge
+                            CONSENSUS_CURRENT_SLOT.set(executed_slot as i64);
                             
                             // Record TX latencies for all digests in the slot
                             for digest in all_digests_in_slot.iter() {
@@ -295,7 +302,7 @@ impl Committer {
                 let slot_rate = slots_committed as f64 / elapsed;
                 let pending_slots = state.log.len();
                 
-                // Note: PRIMARY_PENDING_SLOTS gauge is updated after each commit message processing,
+                // Note: CONSENSUS_PENDING_SLOTS gauge is updated after each commit message processing,
                 // not here, to ensure Prometheus always sees current values
                 
                 info!("COMMITTER: Received {} commit msgs ({:.1}/s), executed {} slots ({:.1} slot/s), {} pending in last {:.1}s", 

@@ -4,7 +4,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
 use crate::messages::{ConsensusMessage, Header, Proposal, proposal_digest};
-use crate::metrics::PRIMARY_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL;
+use crate::metrics::DISSEMINATION_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL;
 use crate::primary::{Height, PrimaryMessage, PrimaryWorkerMessage};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
@@ -165,7 +165,7 @@ impl HeaderWaiter {
                     match message {
                         WaiterMessage::SyncBatches(missing, header, force_sync) => {
                             // Track sync request received
-                            PRIMARY_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL.inc();
+                            DISSEMINATION_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL.inc();
 
                             debug!("Synching the payload of {}", header);
                             let header_id = header.id.clone();

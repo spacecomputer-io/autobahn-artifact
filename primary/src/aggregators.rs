@@ -3,7 +3,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult, ConsensusError};
 use crate::messages::{Certificate, Header, Vote, QC, Timeout, TC};
-use crate::metrics::PRIMARY_DAG_CERTIFICATES_FORMED_TOTAL;
+use crate::metrics::{DISSEMINATION_CERTIFICATES_FORMED_TOTAL, DISSEMINATION_HEADER_TO_CERT_LATENCY};
 use config::{Committee, Stake};
 use crypto::{PublicKey, Signature, Digest};
 use std::collections::HashSet;
@@ -17,6 +17,7 @@ pub struct VotesAggregator {
 
     pub complete: bool,  //Indicate that QC is ready. Stops adding new signatures
     get_once: bool,  //Indicate that QC was already used. E.g. do not re-submit QC if Timer triggers after we succeeded already
+    created_at: Option<std::time::Instant>, // Track when first vote arrives for header-to-cert latency
 }
 
 impl VotesAggregator {
@@ -27,7 +28,8 @@ impl VotesAggregator {
             used: HashSet::new(),
             diss_cert: None,
             complete: false,
-            get_once: true, 
+            get_once: true,
+            created_at: None,
         }
     }
 
@@ -44,7 +46,12 @@ impl VotesAggregator {
         // Ensure it is the first time this authority votes.
         //println!("author is {:?}", author);
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
-       
+
+        // Track when first vote arrives for header-to-cert latency
+        if self.created_at.is_none() {
+            self.created_at = Some(std::time::Instant::now());
+        }
+
         self.votes.push((author, vote.signature));
         self.dissemination_weight += committee.stake(&author);
 
@@ -60,7 +67,12 @@ impl VotesAggregator {
 
                 self.diss_cert = Some(dissemination_cert);
                 // Metric: dissemination certificate formed (f+1 votes)
-                PRIMARY_DAG_CERTIFICATES_FORMED_TOTAL.inc();
+                DISSEMINATION_CERTIFICATES_FORMED_TOTAL.inc();
+                // Observe header-to-certificate latency
+                if let Some(start) = self.created_at {
+                    let latency_ms = start.elapsed().as_millis() as f64;
+                    DISSEMINATION_HEADER_TO_CERT_LATENCY.observe(latency_ms);
+                }
             }
             self.complete = true;
             //return Ok(self.diss_cert.clone());

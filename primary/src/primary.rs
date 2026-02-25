@@ -23,7 +23,7 @@ use log::{info, debug, warn, error};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use crate::metrics::{
     record_tx_submit_ms, record_batch_size_bytes, record_tx_count,
-    PRIMARY_DAG_DIGESTS_OWN_BATCHES_TOTAL, PRIMARY_DAG_DIGESTS_OTHERS_BATCHES_TOTAL
+    DISSEMINATION_DIGESTS_OWN_BATCHES_TOTAL, DISSEMINATION_DIGESTS_OTHERS_BATCHES_TOTAL
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -340,7 +340,7 @@ impl MessageHandler for WorkerReceiverHandler {
         match bincode::deserialize(&serialized) {
             Ok(message) => match message {
                 WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes, tx_count) => {
-                    PRIMARY_DAG_DIGESTS_OWN_BATCHES_TOTAL.inc();
+                    DISSEMINATION_DIGESTS_OWN_BATCHES_TOTAL.inc();
                     record_batch_size_bytes(&digest, batch_size_bytes);
                     record_tx_count(&digest, tx_count);
                     if first_tx_submit_ms > 0 { 
@@ -365,7 +365,7 @@ impl MessageHandler for WorkerReceiverHandler {
                     }
                 },
                 WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes) => {
-                    PRIMARY_DAG_DIGESTS_OTHERS_BATCHES_TOTAL.inc();
+                    DISSEMINATION_DIGESTS_OTHERS_BATCHES_TOTAL.inc();
                     record_batch_size_bytes(&digest, batch_size_bytes);
                     
                     // Use try_send to detect channel backpressure
