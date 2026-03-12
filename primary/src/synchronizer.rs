@@ -14,6 +14,7 @@ use log::debug;
 use std::collections::HashMap;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time;
 
 /// The `Synchronizer` checks if we have all batches and parents referenced by a header. If we don't, it sends
 /// a command to the `Waiter` to request the missing data.
@@ -257,20 +258,39 @@ impl Synchronizer {
         proposal: Proposal,
         stop_height: Height,
     ) -> DagResult<Vec<Header>> {
-        // The list of blocks for this proposal
         let mut ancestors: Vec<Header> = Vec::new();
 
-        // NOTE: Before calling, must check if proposal is ready, assumes that proposal is ready
-        // before calling
         debug!("proposal height is {:?}", proposal.height);
-        let mut header: Header = self.get_header(proposal.header_digest).await.expect("already synced should have header").unwrap();
 
-        // Otherwise we have the header and all of its ancestors
+        // Wait for the proposal header to be available (may need background sync to deliver it)
+        let mut header: Header = loop {
+            match self.get_header(proposal.header_digest.clone()).await? {
+                Some(h) => break h,
+                None => {
+                    debug!("Committer waiting for header {} at height {}", proposal.header_digest, proposal.height);
+                    self.tx_header_waiter
+                        .send(WaiterMessage::SyncHeader(proposal.header_digest.clone()))
+                        .await
+                        .expect("Failed to send sync header request");
+                    time::sleep(time::Duration::from_millis(50)).await;
+                }
+            }
+        };
+
         let mut current_height = proposal.height;
         while current_height > stop_height {
             debug!("current height is {:?}, stop height is {:?}", current_height, stop_height);
             ancestors.push(header.clone());
-            header = self.get_parent_header(&header).await?.expect("should have parent by now");
+            // Wait for parent header (may need background sync)
+            header = loop {
+                match self.get_parent_header(&header).await? {
+                    Some(h) => break h,
+                    None => {
+                        debug!("Committer waiting for parent of header at height {}", current_height);
+                        time::sleep(time::Duration::from_millis(50)).await;
+                    }
+                }
+            };
             current_height = header.height();
         }
 

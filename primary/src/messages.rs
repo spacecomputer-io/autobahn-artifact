@@ -26,13 +26,18 @@ pub mod messages_tests;
 pub struct Proposal {
     pub header_digest: Digest,
     pub height: Height,
+    /// Dissemination certificate (PoA) proving f+1 replicas possess this header.
+    /// Enables non-blocking consensus voting: replicas verify the certificate
+    /// instead of requiring local data availability before voting.
+    pub certificate: Certificate,
 }
 
 impl Proposal {
-    pub async fn new(header_digest: Digest, height: Height) -> Self {
+    pub async fn new(header_digest: Digest, height: Height, certificate: Certificate) -> Self {
         Self {
             header_digest,
             height,
+            certificate,
         }
     }
 }
@@ -496,6 +501,7 @@ impl Header {
 
 
     pub fn genesis_proposals(committee: &Committee) -> HashMap<PublicKey, Proposal> {
+        let genesis_certs = Certificate::genesis_certs(committee);
         committee
             .authorities
             .iter()
@@ -508,6 +514,7 @@ impl Header {
                             ..Self::default()
                         }.digest(),
                         height: 0,
+                        certificate: genesis_certs.get(pk).unwrap().clone(),
                     },
                 )
             })
@@ -873,6 +880,42 @@ impl Certificate {
                 )
             })
             .collect()
+    }
+
+    /// Verify this certificate has f+1 stake (proof of availability).
+    /// Dissemination certs are formed at validity_threshold (f+1), so this is
+    /// the correct check for PoA verification in non-blocking consensus voting.
+    /// Verify this certificate has f+1 stake (proof of availability) with valid signatures.
+    /// Dissemination certs are formed at validity_threshold (f+1), so this is
+    /// the correct check for PoA verification in non-blocking consensus voting.
+    pub fn verify_availability(&self, committee: &Committee) -> DagResult<()> {
+        if Self::genesis(committee).contains(self) {
+            return Ok(());
+        }
+        let mut weight = 0;
+        let mut used = HashSet::new();
+        for (name, _) in self.votes.iter() {
+            ensure!(!used.contains(name), DagError::AuthorityReuse(*name));
+            let voting_rights = committee.stake(name);
+            ensure!(voting_rights > 0, DagError::UnknownAuthority(*name));
+            used.insert(*name);
+            weight += voting_rights;
+        }
+        ensure!(
+            weight >= committee.validity_threshold(),
+            DagError::CertificateRequiresQuorum
+        );
+        // Verify signatures — same logic as verify() to prevent forged PoAs
+        let mut digests = Vec::new();
+        for (_i, _) in self.votes.iter().enumerate() {
+            digests.push({
+                let mut hasher = Sha512::new();
+                hasher.update(&self.header_digest);
+                hasher.update(self.height().to_le_bytes());
+                Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+            })
+        }
+        Signature::verify_batch_multi(&digests, &self.votes).map_err(DagError::from)
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {

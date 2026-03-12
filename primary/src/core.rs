@@ -280,8 +280,12 @@ impl Core {
         self.votes_aggregator = VotesAggregator::new();
 
         match self.use_optimistic_tips { //Add early here, so that enough coverage will include leader tip.
-            true => self.current_proposal_tips.insert(header.origin(), Proposal {header_digest: header.digest(), height: header.height(),}),
-            false => self.current_certified_tips.insert(header.origin(), Proposal {header_digest: header.digest(), height: header.height(),}),
+            true => self.current_proposal_tips.insert(header.origin(), Proposal {header_digest: header.digest(), height: header.height(), certificate: header.parent_cert.clone(),}),
+            false => self.current_certified_tips.insert(header.origin(), Proposal {
+                header_digest: header.parent_cert.header_digest.clone(),
+                height: header.parent_cert.height,
+                certificate: header.parent_cert.clone(),
+            }),
         };
 
         // Augment consensus messages with latest prepares
@@ -413,6 +417,7 @@ impl Core {
                 Proposal {
                     header_digest: header.digest(),
                     height: header.height(),
+                    certificate: header.parent_cert.clone(),
                 },
             );
             //println!("updating tip");
@@ -429,6 +434,7 @@ impl Core {
                 Proposal {
                     header_digest: header.parent_cert.header_digest.clone(),
                     height: header.parent_cert.height,
+                    certificate: header.parent_cert.clone(),
                 },
             );
             //println!("updating tip");
@@ -984,9 +990,14 @@ impl Core {
                         true =>  self.current_proposal_tips.clone(),
                         false => self.current_certified_tips.clone(),
                     };
-                   
-                    // Leader tip proposal
-                    proposals.insert(self.name, Proposal { header_digest: header.id.clone(), height: header.height });
+
+                    // Leader tip proposal: in optimistic mode, override with the current
+                    // (uncertified) header. In certified mode, keep the certified tip
+                    // already present in current_certified_tips — injecting an uncertified
+                    // header would break non-blocking PoA verification at voters.
+                    if self.use_optimistic_tips {
+                        proposals.insert(self.name, Proposal { header_digest: header.id.clone(), height: header.height, certificate: header.parent_cert.clone() });
+                    }
 
                     for (pk, proposal) in proposals {
                         debug!("new proposal height is {:?}", proposal.height);
@@ -1472,10 +1483,58 @@ impl Core {
                     record_observer_prepare_receive(*slot);
                 }
                 
-                if self.synchronizer.get_proposals(&consensus_message, &header).await.unwrap().is_empty() {
-                    debug!("proposals of prepare in slot {:?} with proposal {:?} are not ready", slot, proposals);
-                    return Ok(());
+                // Non-blocking sync (certified tips only): verify proposal certificates
+                // (PoA) instead of requiring local data availability. Per the Autobahn
+                // paper, certified tips transitively prove availability, allowing replicas
+                // to vote without blocking on data synchronization.
+                //
+                // With optimistic tips, proposals may reference uncertified headers, so
+                // we must fall back to the blocking sync path.
+                if self.use_optimistic_tips {
+                    // Blocking path: require local data availability
+                    if self.synchronizer.get_proposals(&consensus_message, &header).await.unwrap().is_empty() {
+                        debug!("proposals of prepare in slot {:?} are not ready (optimistic tips)", slot);
+                        return Ok(());
+                    }
+                } else {
+                    // Non-blocking path: verify each proposal's PoA certificate.
+                    // In certified tips mode, ALL proposals (including the leader's own)
+                    // reference certified headers with matching PoA certs.
+                    let mut all_certs_valid = true;
+                    for (pk, proposal) in proposals {
+                        if proposal.height == 0 {
+                            continue; // Genesis proposals are always valid
+                        }
+                        // Verify PoA: f+1 valid signatures (availability threshold)
+                        if let Err(e) = proposal.certificate.verify_availability(&self.committee) {
+                            warn!("CORE: Invalid PoA in Prepare slot {} for lane {:?}: {:?}", slot, pk, e);
+                            all_certs_valid = false;
+                            break;
+                        }
+                        // Verify the certificate actually certifies this proposal
+                        if proposal.certificate.header_digest != proposal.header_digest
+                            || proposal.certificate.height != proposal.height {
+                            warn!("CORE: PoA mismatch in Prepare slot {} for lane {:?}: \
+                                   cert({}, {}) != proposal({}, {})",
+                                   slot, pk,
+                                   proposal.certificate.height, proposal.certificate.header_digest,
+                                   proposal.height, proposal.header_digest);
+                            all_certs_valid = false;
+                            break;
+                        }
+                    }
+
+                    if !all_certs_valid {
+                        debug!("Prepare in slot {:?} has invalid proposal certificates, dropping", slot);
+                        return Ok(());
+                    }
+
+                    // Fire background sync for any missing proposal data (non-blocking).
+                    // The data will be needed at execution time, not vote time.
+                    let _ = self.synchronizer.get_proposals(&consensus_message, &header).await;
                 }
+
+                // Vote — for certified tips the PoA guarantees data is recoverable
                 self.process_prepare_message(&consensus_message, consensus_votes.as_mut()).await;
             },
             ConsensusMessage::Confirm {
@@ -1716,29 +1775,22 @@ impl Core {
                     }
                 }
 
-                // Only send to committer if proposals and all ancestors are stored locally,
-                // otherwise sync will be triggered, and this commit message will be reprocessed
-                let proposals_ready = self.synchronizer.get_proposals(&commit_message, &header).await.unwrap();
-                if !proposals_ready.is_empty() {
-                    //println!("Sent to committer");
-                    debug!("sending to committer for slot {}", sl);
-                    
-                    // Try send first to detect backpressure
-                    match self.tx_committer.try_send(commit_message.clone()) {
-                        Ok(_) => {},
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            warn!("CORE: tx_committer channel FULL for slot {}! Committer may be overloaded", sl);
-                            // Fallback to blocking send
-                            if let Err(e) = self.tx_committer.send(commit_message).await {
-                                error!("CORE: CRITICAL - Failed to send commit for slot {}: {}", sl, e);
-                            }
-                        },
-                        Err(e) => {
-                            error!("CORE: CRITICAL - tx_committer channel closed for slot {}: {}", sl, e);
+                // Fire background sync for any missing proposal data (non-blocking)
+                let _ = self.synchronizer.get_proposals(&commit_message, &header).await;
+
+                // Always forward to committer — it will wait for sync before executing
+                debug!("sending to committer for slot {}", sl);
+                match self.tx_committer.try_send(commit_message.clone()) {
+                    Ok(_) => {},
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        warn!("CORE: tx_committer channel FULL for slot {}! Committer may be overloaded", sl);
+                        if let Err(e) = self.tx_committer.send(commit_message).await {
+                            error!("CORE: CRITICAL - Failed to send commit for slot {}: {}", sl, e);
                         }
+                    },
+                    Err(e) => {
+                        error!("CORE: CRITICAL - tx_committer channel closed for slot {}: {}", sl, e);
                     }
-                } else {
-                    debug!("CORE: Commit for slot {} blocked - waiting for proposals to sync", sl);
                 }
 
                 //Try waking any prepares that are waiting for a QC ticket
@@ -1828,11 +1880,9 @@ impl Core {
                 // sent to the committer once a commit message is received
             },
             ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals: _ } => {
-                // Send the commit message to the committer to order everything
-                self.tx_committer
-                    .send(consensus_message)
-                    .await
-                    .expect("Failed to send to committer");
+                // No-op: commits are now always forwarded immediately in process_commit_message.
+                // The committer handles duplicates via its pending log.
+                debug!("Ignoring Commit loopback - already forwarded to committer");
             },
         };
         Ok(())

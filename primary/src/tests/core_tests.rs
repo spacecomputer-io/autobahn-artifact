@@ -668,7 +668,7 @@ async fn process_prepare() {
 
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height(), certificate: certificate(x) });
     }
     let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket: None, proposals };
 
@@ -815,7 +815,7 @@ async fn generate_confirm() {
 
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height(), certificate: certificate(x) });
     }
     let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket:None, proposals: proposals.clone() };
 
@@ -962,7 +962,7 @@ async fn generate_commit() {
 
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height(), certificate: certificate(x) });
     }
     let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket: None, proposals: proposals.clone() };
 
@@ -1153,7 +1153,7 @@ async fn generate_pipelined_prepare() {
 
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height(), certificate: certificate(x) });
     }
     let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket: None, proposals };
 
@@ -1427,7 +1427,7 @@ async fn sync_missing_proposals() {
 
     let mut proposals: HashMap<PublicKey, Proposal> = HashMap::new();
     for x in &header_list {
-        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height() });
+        proposals.insert(x.author, Proposal { header_digest: x.digest(), height: x.height(), certificate: certificate(x) });
     }
     let prepare_message: ConsensusMessage = ConsensusMessage::Prepare { slot: 1, view: 1, tc: None, qc_ticket: None, proposals };
 
