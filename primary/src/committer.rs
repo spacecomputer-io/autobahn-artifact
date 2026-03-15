@@ -165,7 +165,13 @@ impl Committer {
                                     }
 
                                     let get_headers_start = std::time::Instant::now();
-                                    let headers = self.synchronizer.get_all_headers_for_proposal(proposal.clone(), stop_height)
+                                    let headers = self
+                                        .synchronizer
+                                        .get_all_headers_for_proposal(
+                                            proposal.clone(),
+                                            stop_height,
+                                            executing_slot,
+                                        )
                                         .await
                                         .expect("should have ancestors by now");
                                     let sync_elapsed = get_headers_start.elapsed();

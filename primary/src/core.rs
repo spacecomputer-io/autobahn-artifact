@@ -1909,6 +1909,8 @@ impl Core {
 
     async fn process_recovered_proposal_headers(&mut self, headers: Vec<Header>) -> DagResult<()> {
         if let Some(last_header) = headers.last() {
+            // Helper replies are reversed to oldest->newest, so `last()` is the
+            // original proposal tip digest used as the committed suffix-sync key.
             self.synchronizer
                 .finish_committed_proposal_sync(last_header.digest())
                 .await?;

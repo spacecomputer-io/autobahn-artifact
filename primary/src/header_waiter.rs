@@ -41,7 +41,7 @@ pub enum WaiterMessage {
     SyncProposals(Vec<Proposal>, ConsensusMessage, Header),
     SyncParent(Digest, Header),
     SyncHeader(Digest),
-    SyncCommittedProposal(Proposal, Height),
+    SyncCommittedProposal(Proposal, Height, Slot),
     ClearCommittedProposalSync(Digest),
 }
 
@@ -79,7 +79,7 @@ pub struct HeaderWaiter {
     header_requests: HashMap<Digest, (Height, u128)>,
     /// Keeps the digests of the all tx batches for which we sent a sync request,
     /// similarly to `header_requests`.
-    batch_requests: HashMap<Digest, Height>,
+    batch_requests: HashMap<Digest, (Height, bool)>,
     /// List of digests (either certificates, headers or tx batch) that are waiting
     /// to be processed. Their processing will resume when we get all their dependencies.
     pending: HashMap<Digest, (Height, Sender<()>)>,
@@ -90,6 +90,8 @@ pub struct HeaderWaiter {
     /// [F] Pending proposal sync requests ordered by slot, so lower slots get
     /// processed first. This is a simple Vec that we sort before draining.
     pending_proposal_syncs: Vec<PendingProposalSync>,
+    /// Newly arrived commit-time suffix sync requests ordered by slot.
+    pending_commit_syncs: Vec<PendingCommitSync>,
     /// Commit-time suffix sync requests keyed by proposal digest.
     proposal_sync_requests: HashMap<Digest, PendingSuffixSync>,
 }
@@ -102,10 +104,16 @@ struct PendingProposalSync {
     header: Header,
 }
 
+struct PendingCommitSync {
+    slot: Slot,
+    digest: Digest,
+}
+
 #[derive(Clone)]
 struct PendingSuffixSync {
     proposal: Proposal,
     stop_height: Height,
+    slot: Slot,
     timestamp: u128,
 }
 
@@ -142,6 +150,7 @@ impl HeaderWaiter {
                 pending: HashMap::new(),
                 inflight_proposals: HashSet::new(),
                 pending_proposal_syncs: Vec::new(),
+                pending_commit_syncs: Vec::new(),
                 proposal_sync_requests: HashMap::new(),
             }
             .run()
@@ -198,7 +207,7 @@ impl HeaderWaiter {
     /// [F] Process pending proposal syncs in slot-priority order (lowest slot first).
     /// This ensures that sync bandwidth is focused on unblocking the oldest stalled
     /// consensus slots, which is critical during partition recovery.
-    async fn drain_pending_proposal_syncs(&mut self, waiting: &mut FuturesUnordered<impl futures::Future>) {
+    async fn drain_pending_proposal_syncs(&mut self) {
         if self.pending_proposal_syncs.is_empty() {
             return;
         }
@@ -222,7 +231,68 @@ impl HeaderWaiter {
 
         DISSEMINATION_INFLIGHT_HOLES.set(inflight_holes.len() as i64);
         DISSEMINATION_HOLE_DEPENDENTS
-            .set((self.pending.len() + self.pending_proposal_syncs.len()) as i64);
+            .set((self.pending.len() + self.pending_proposal_syncs.len() + self.pending_commit_syncs.len()) as i64);
+    }
+
+    fn certifier_addresses(&self, proposal: &Proposal) -> Vec<std::net::SocketAddr> {
+        proposal
+            .certificate
+            .votes
+            .iter()
+            .map(|(pk, _)| *pk)
+            .filter(|pk| *pk != self.name)
+            .filter_map(|pk| self.committee.primary(&pk).ok())
+            .map(|addresses| addresses.primary_to_primary)
+            .collect()
+    }
+
+    fn other_primary_addresses(&self) -> Vec<std::net::SocketAddr> {
+        self.committee
+            .others_primaries(&self.name)
+            .iter()
+            .map(|(_, addresses)| addresses.primary_to_primary)
+            .collect()
+    }
+
+    async fn dispatch_pending_commit_syncs(&mut self) {
+        if self.pending_commit_syncs.is_empty() {
+            return;
+        }
+
+        self.pending_commit_syncs.sort_by_key(|pending| pending.slot);
+        let syncs: Vec<_> = self.pending_commit_syncs.drain(..).collect();
+        let mut seen = HashSet::new();
+
+        for pending in syncs {
+            if !seen.insert(pending.digest.clone()) {
+                continue;
+            }
+
+            let Some(request) = self.proposal_sync_requests.get(&pending.digest).cloned() else {
+                continue;
+            };
+
+            let certifiers = self.certifier_addresses(&request.proposal);
+            let message = PrimaryMessage::ProposalHeadersRequest(
+                request.proposal,
+                request.stop_height,
+                self.name,
+            );
+            let bytes = bincode::serialize(&message)
+                .expect("Failed to serialize proposal suffix request");
+
+            if certifiers.is_empty() {
+                let addresses = self.other_primary_addresses();
+                self.network
+                    .lucky_broadcast(addresses, Bytes::from(bytes), INITIAL_SYNC_FANOUT)
+                    .await;
+            } else {
+                let fanout = certifiers.len();
+                self.network
+                    .lucky_broadcast(certifiers, Bytes::from(bytes), fanout)
+                    .await;
+            }
+        }
     }
 
     /// Execute a single proposal sync: register waiters and send network requests.
@@ -324,41 +394,55 @@ impl HeaderWaiter {
                             let round = header.height;
                             let author = header.author;
 
-                            // Ensure we sync only once per header.
+                            // Ensure we sync only once per header waiter, but still allow
+                            // commit-critical payload recovery to upgrade an existing wait.
                             if self.pending.contains_key(&header_id) {
-                                continue;
+                                if !force_sync {
+                                    continue;
+                                }
+                            } else {
+                                // Add the header to the waiter pool. The waiter will return it to when all
+                                // its parents are in the store.
+                                let wait_for = missing
+                                    .iter()
+                                    .map(|(digest, worker_id)| {
+                                        let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
+                                        (key.to_vec(), self.store.clone())
+                                    })
+                                    .collect();
+                                let (tx_cancel, rx_cancel) = channel(1);
+                                self.pending.insert(header_id, (round, tx_cancel));
+                                let fut = Self::waiter(wait_for, header, rx_cancel);
+                                waiting.push(fut);
                             }
-
-                            // Add the header to the waiter pool. The waiter will return it to when all
-                            // its parents are in the store.
-                            let wait_for = missing
-                                .iter()
-                                .map(|(digest, worker_id)| {
-                                    let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
-                                    (key.to_vec(), self.store.clone())
-                                })
-                                .collect();
-                            let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(header_id, (round, tx_cancel));
-                            let fut = Self::waiter(wait_for, header, rx_cancel);
-                            waiting.push(fut);
 
                             if force_sync {
                                 // Ensure we didn't already send a sync request for these parents.
                                 let mut requires_sync = HashMap::new();
                                 for (digest, worker_id) in missing.into_iter() {
-                                    self.batch_requests.entry(digest.clone()).or_insert_with(|| {
-                                        requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest);
-                                        round
-                                    });
+                                    let entry = self
+                                        .batch_requests
+                                        .entry(digest.clone())
+                                        .or_insert((round, false));
+                                    if !entry.1 {
+                                        requires_sync
+                                            .entry(worker_id)
+                                            .or_insert_with(Vec::new)
+                                            .push(digest.clone());
+                                        entry.1 = true;
+                                    }
+                                    entry.0 = round;
                                 }
                                 for (worker_id, digests) in requires_sync {
+                                    // PrimaryWorkerMessage is delivered to our local worker over
+                                    // `primary_to_worker`; the remote author is carried inside the
+                                    // message so the worker can fetch from that authority's worker.
                                     let address = self.committee
                                         .worker(&self.name, &worker_id)
-                                        .expect("Author of valid header is not in the committee")
+                                        .expect("Our worker is not in the committee")
                                         .primary_to_worker;
                                     debug!("Sent syncbatches message for height {}", round);
-                                    let message = PrimaryWorkerMessage::Synchronize(digests, author);
+                                    let message = PrimaryWorkerMessage::SynchronizeCommitted(digests, author);
                                     let bytes = bincode::serialize(&message)
                                         .expect("Failed to serialize batch sync request");
                                     self.network.send(address, Bytes::from(bytes)).await;
@@ -394,39 +478,42 @@ impl HeaderWaiter {
                             }
                         }
 
-                        WaiterMessage::SyncCommittedProposal(proposal, stop_height) => {
+                        WaiterMessage::SyncCommittedProposal(proposal, stop_height, slot) => {
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .expect("Failed to measure time")
                                 .as_millis();
 
-                            let is_new_request = !self
-                                .proposal_sync_requests
-                                .contains_key(&proposal.header_digest);
-                            self.proposal_sync_requests
-                                .entry(proposal.header_digest.clone())
-                                .or_insert_with(|| PendingSuffixSync {
-                                    proposal: proposal.clone(),
-                                    stop_height,
-                                    timestamp: now,
-                                });
+                            let digest = proposal.header_digest.clone();
+                            let mut queue_request = false;
+                            match self.proposal_sync_requests.get_mut(&digest) {
+                                Some(request) => {
+                                    if slot < request.slot {
+                                        request.slot = slot;
+                                        queue_request = true;
+                                    }
+                                    if stop_height < request.stop_height {
+                                        request.stop_height = stop_height;
+                                        queue_request = true;
+                                    }
+                                }
+                                None => {
+                                    self.proposal_sync_requests.insert(
+                                        digest.clone(),
+                                        PendingSuffixSync {
+                                            proposal,
+                                            stop_height,
+                                            slot,
+                                            timestamp: now,
+                                        },
+                                    );
+                                    queue_request = true;
+                                }
+                            }
 
-                            if is_new_request {
-                                let addresses: Vec<_> = self.committee
-                                    .others_primaries(&self.name)
-                                    .iter()
-                                    .map(|(_, x)| x.primary_to_primary)
-                                    .collect();
-                                let message = PrimaryMessage::ProposalHeadersRequest(
-                                    proposal,
-                                    stop_height,
-                                    self.name,
-                                );
-                                let bytes = bincode::serialize(&message)
-                                    .expect("Failed to serialize proposal suffix request");
-                                self.network
-                                    .lucky_broadcast(addresses, Bytes::from(bytes), INITIAL_SYNC_FANOUT)
-                                    .await;
+                            if queue_request {
+                                self.pending_commit_syncs.push(PendingCommitSync { slot, digest });
+                                self.dispatch_pending_commit_syncs().await;
                             }
                         }
 
@@ -523,19 +610,11 @@ impl HeaderWaiter {
                 // that send directly to tx_consensus_loopback when complete.
 
                 () = &mut timer => {
+                    self.dispatch_pending_commit_syncs().await;
+
                     // [F] First, process any queued proposal syncs in slot-priority order.
                     // Sort by slot ascending so lowest (most critical) slots sync first.
-                    if !self.pending_proposal_syncs.is_empty() {
-                        self.pending_proposal_syncs.sort_by_key(|p| p.slot);
-                        let syncs: Vec<_> = self.pending_proposal_syncs.drain(..).collect();
-                        for sync in syncs {
-                            self.execute_proposal_sync(
-                                sync.missing,
-                                sync.consensus_message,
-                                sync.header,
-                            ).await;
-                        }
-                    }
+                    self.drain_pending_proposal_syncs().await;
 
                     // We optimistically sent sync requests to a single node. If this timer triggers,
                     // it means we were wrong to trust it. We are done waiting for a reply and we now
@@ -615,14 +694,20 @@ impl HeaderWaiter {
                     }
                 }
                 self.pending.retain(|_, (r, _)| r > &mut gc_round);
-                self.batch_requests.retain(|_, r| r > &mut gc_round);
+                self.batch_requests.retain(|_, (r, _)| r > &mut gc_round);
                 self.parent_requests.retain(|_, (r, _)| r > &mut gc_round);
                 self.header_requests.retain(|_, (r, _)| r > &mut gc_round);
                 self.proposal_sync_requests
                     .retain(|_, request| request.proposal.height > gc_round);
-                // [E1] Clean up inflight proposals that have been GC'd
-                // (We can't easily track heights here, so we just clear old entries
-                // when the set grows too large — the parent_requests dedup still works)
+                let active_proposal_syncs: HashSet<_> =
+                    self.proposal_sync_requests.keys().cloned().collect();
+                self.pending_commit_syncs
+                    .retain(|pending| active_proposal_syncs.contains(&pending.digest));
+                // Keep only proposal digests that still have outstanding header fetch state.
+                let active_parent_requests: HashSet<_> =
+                    self.parent_requests.keys().cloned().collect();
+                self.inflight_proposals
+                    .retain(|digest| active_parent_requests.contains(digest));
             }
             self.update_recovery_metrics();
         }

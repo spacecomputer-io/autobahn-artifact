@@ -10,6 +10,7 @@ use crate::metrics::{
     CONSENSUS_COMMITTER_BLOCKED_TOTAL, CONSENSUS_COMMITTER_WAITS_TOTAL,
     DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL,
 };
+use crate::primary::Slot;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
@@ -268,6 +269,7 @@ impl Synchronizer {
         &mut self,
         proposal: Proposal,
         stop_height: Height,
+        slot: Slot,
     ) -> DagResult<Vec<Header>> {
         let mut ancestors: Vec<Header> = Vec::new();
         let mut counted_header_block = false;
@@ -293,6 +295,7 @@ impl Synchronizer {
                             .send(WaiterMessage::SyncCommittedProposal(
                                 proposal.clone(),
                                 stop_height,
+                                slot,
                             ))
                             .await
                             .expect("Failed to send proposal suffix request");
@@ -349,6 +352,7 @@ impl Synchronizer {
                                 .send(WaiterMessage::SyncCommittedProposal(
                                     proposal.clone(),
                                     stop_height,
+                                    slot,
                                 ))
                                 .await
                                 .expect("Failed to send proposal suffix request");
