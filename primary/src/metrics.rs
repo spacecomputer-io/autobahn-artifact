@@ -129,6 +129,31 @@ lazy_static! {
             "Total number of header sync requests received"
         ).expect("failed to register dissemination_header_sync_requests_received_total");
 
+    pub static ref DISSEMINATION_SYNC_RETRIES_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "dissemination_sync_retries_total",
+            "Total number of sync retries triggered by recovery logic, by kind",
+            &["kind"]
+        ).expect("failed to register dissemination_sync_retries_total");
+
+    pub static ref DISSEMINATION_INFLIGHT_HOLES: IntGauge =
+        register_int_gauge!(
+            "dissemination_inflight_holes",
+            "Number of unique missing digests currently being recovered"
+        ).expect("failed to register dissemination_inflight_holes");
+
+    pub static ref DISSEMINATION_HOLE_DEPENDENTS: IntGauge =
+        register_int_gauge!(
+            "dissemination_hole_dependents",
+            "Number of blocked waiters currently depending on hole recovery"
+        ).expect("failed to register dissemination_hole_dependents");
+
+    pub static ref DISSEMINATION_RECOVERED_HEADERS_TOTAL: IntCounter =
+        register_int_counter!(
+            "dissemination_recovered_headers_total",
+            "Total number of headers delivered back into core after sync recovery"
+        ).expect("failed to register dissemination_recovered_headers_total");
+
     /// NEW: Time from header broadcast to f+1 certificate formation
     pub static ref DISSEMINATION_HEADER_TO_CERT_LATENCY: Histogram =
         register_histogram!(
@@ -271,6 +296,32 @@ lazy_static! {
             "consensus_current_slot",
             "Current consensus slot number (slope = throughput, stalls = async)"
         ).expect("failed to register consensus_current_slot");
+
+    pub static ref CONSENSUS_OLDEST_BLOCKED_SLOT: IntGauge =
+        register_int_gauge!(
+            "consensus_oldest_blocked_slot",
+            "Oldest slot currently blocked waiting on execution-time recovery"
+        ).expect("failed to register consensus_oldest_blocked_slot");
+
+    pub static ref CONSENSUS_COMMITTER_BLOCKED_TOTAL: IntCounter =
+        register_int_counter!(
+            "consensus_committer_blocked_total",
+            "Total number of times the committer encountered missing execution data"
+        ).expect("failed to register consensus_committer_blocked_total");
+
+    pub static ref CONSENSUS_COMMITTER_WAITS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "consensus_committer_waits_total",
+            "Total number of committer waits by missing dependency kind",
+            &["kind"]
+        ).expect("failed to register consensus_committer_waits_total");
+
+    pub static ref CONSENSUS_COMMITTER_SYNC_LATENCY: Histogram =
+        register_histogram!(
+            "consensus_committer_sync_latency_ms",
+            "Time spent waiting for proposal headers and ancestors during execution (ms)",
+            vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]
+        ).expect("failed to register consensus_committer_sync_latency_ms");
 
     pub static ref CONSENSUS_ACTIVE_NODES_IN_SLOT: IntGauge =
         register_int_gauge!(

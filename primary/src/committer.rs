@@ -15,7 +15,7 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use crate::metrics::{DISSEMINATION_HEADERS_COMMITTED_TOTAL, CONSENSUS_SLOTS_EXECUTED_TOTAL, CONSENSUS_SLOT_EXECUTION_LATENCY, CONSENSUS_PENDING_SLOTS, DISSEMINATION_DAG_HEIGHT, CONSENSUS_HEADERS_BY_NODE, CONSENSUS_BYTES_BY_NODE, CONSENSUS_DIGESTS_BY_NODE, CONSENSUS_ACTIVE_NODES_IN_SLOT, CONSENSUS_CURRENT_SLOT, observe_slot_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, take_tx_count, record_flush_interval_commit};
+use crate::metrics::{DISSEMINATION_HEADERS_COMMITTED_TOTAL, CONSENSUS_SLOTS_EXECUTED_TOTAL, CONSENSUS_SLOT_EXECUTION_LATENCY, CONSENSUS_PENDING_SLOTS, DISSEMINATION_DAG_HEIGHT, CONSENSUS_HEADERS_BY_NODE, CONSENSUS_BYTES_BY_NODE, CONSENSUS_DIGESTS_BY_NODE, CONSENSUS_ACTIVE_NODES_IN_SLOT, CONSENSUS_CURRENT_SLOT, CONSENSUS_OLDEST_BLOCKED_SLOT, CONSENSUS_COMMITTER_SYNC_LATENCY, observe_slot_latency, observe_tx_submit_to_commit_latency, take_batch_size_bytes, take_tx_count, record_flush_interval_commit};
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -146,27 +146,30 @@ impl Committer {
                 while state.log.contains_key(&(state.last_executed_slot + 1)) {
                     let slot_start_time = std::time::Instant::now();
                     let current_commit_message = state.log.get(&(state.last_executed_slot + 1)).unwrap();
-                    debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
-                    match current_commit_message {
-                        ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
-                            let sync_start = std::time::Instant::now();
-                            let mut total_headers_committed = 0;
-                            let mut active_nodes = HashSet::new();
-                            let mut all_digests_in_slot: Vec<Digest> = Vec::new(); // Collect all digests to observe latency AFTER slot commit
-                            
-                            for (pk, proposal) in proposals {
-                                let stop_height = *state.last_executed_heights.get(pk).unwrap();
-                                // Don't execute proposals which are too old
-                                if proposal.height <= stop_height {
+                        debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
+                        match current_commit_message {
+                            ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
+                                let sync_start = std::time::Instant::now();
+                                let mut total_headers_committed = 0;
+                                let mut active_nodes = HashSet::new();
+                                let mut all_digests_in_slot: Vec<Digest> = Vec::new(); // Collect all digests to observe latency AFTER slot commit
+                                let executing_slot = state.last_executed_slot + 1;
+                                CONSENSUS_OLDEST_BLOCKED_SLOT.set(executing_slot as i64);
+                                
+                                for (pk, proposal) in proposals {
+                                    let stop_height = *state.last_executed_heights.get(pk).unwrap();
+                                    // Don't execute proposals which are too old
+                                    if proposal.height <= stop_height {
                                     debug!("skipping this proposal because it's too old");
                                     continue;
-                                }
+                                    }
 
-                                let get_headers_start = std::time::Instant::now();
-                                let headers = self.synchronizer.get_all_headers_for_proposal(proposal.clone(), stop_height)
-                                    .await
-                                    .expect("should have ancestors by now");
-                                let sync_elapsed = get_headers_start.elapsed();
+                                    let get_headers_start = std::time::Instant::now();
+                                    let headers = self.synchronizer.get_all_headers_for_proposal(proposal.clone(), stop_height)
+                                        .await
+                                        .expect("should have ancestors by now");
+                                    let sync_elapsed = get_headers_start.elapsed();
+                                    CONSENSUS_COMMITTER_SYNC_LATENCY.observe(sync_elapsed.as_millis() as f64);
                                 
                                 if sync_elapsed.as_millis() > 10 {
                                     warn!("COMMITTER: Synchronizer took {}ms to get {} headers for proposal at height {}", 
@@ -221,10 +224,10 @@ impl Committer {
                                     
                                     debug!("Finish upcall");
                                 }
-                            }
+                                }
                             
-                            // Record how many unique nodes contributed to this slot
-                            CONSENSUS_ACTIVE_NODES_IN_SLOT.set(active_nodes.len() as i64);
+                                // Record how many unique nodes contributed to this slot
+                                CONSENSUS_ACTIVE_NODES_IN_SLOT.set(active_nodes.len() as i64);
                             
                             let slot_elapsed = slot_start_time.elapsed();
                             let slot_elapsed_ms = slot_elapsed.as_millis() as f64;
@@ -256,6 +259,7 @@ impl Committer {
                             
                             // Remove the executed slot from the pending queue
                             state.log.remove(&state.last_executed_slot);
+                            CONSENSUS_OLDEST_BLOCKED_SLOT.set(0);
                         },
                         _ => {}
                     }

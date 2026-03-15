@@ -1907,6 +1907,37 @@ impl Core {
         Ok(())
     }
 
+    async fn process_recovered_proposal_headers(&mut self, headers: Vec<Header>) -> DagResult<()> {
+        if let Some(last_header) = headers.last() {
+            self.synchronizer
+                .finish_committed_proposal_sync(last_header.digest())
+                .await?;
+        }
+
+        for header in headers {
+            match self.sanitize_header(&header) {
+                Ok(()) => {
+                    // Store recovered headers immediately so suffix sync unblocks ancestry lookup,
+                    // then separately drive payload recovery before execution can use them.
+                    let bytes = bincode::serialize(&header).expect("Failed to serialize recovered header");
+                    self.store.write(header.digest().to_vec(), bytes).await;
+
+                    if self.synchronizer.missing_payload(&header, true).await? {
+                        continue;
+                    }
+
+                    if let Err(e) = self.process_header(header, true).await {
+                        warn!("Failed to process recovered proposal header: {:?}", e);
+                    }
+                }
+                error => {
+                    warn!("Dropping recovered proposal header that failed sanitization: {:?}", error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn qc_timeout() {
 
            //2 tier timeout:
@@ -2406,6 +2437,10 @@ impl Core {
                             consensus_msgs_processed += 1;
                             let result = self.process_consensus_vote(consensus_vote, false, msg_receive_time).await;
                             result
+                        },
+                        PrimaryMessage::ProposalHeaders(headers) => {
+                            headers_processed += headers.len() as u64;
+                            self.process_recovered_proposal_headers(headers).await
                         },
                         _ => panic!("Unexpected core message")
                     };

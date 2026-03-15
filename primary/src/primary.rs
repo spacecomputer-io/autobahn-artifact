@@ -56,6 +56,7 @@ pub enum PrimaryMessage {
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
     HeadersRequest(Vec<Digest>, /* requestor */ PublicKey),
     ProposalHeadersRequest(Proposal, Height, /* requestor */ PublicKey),
+    ProposalHeaders(Vec<Header>),
 }
 
 /// The messages sent by the primary to its workers.
@@ -105,6 +106,7 @@ impl Primary {
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_header_requests, rx_header_requests) = channel(CHANNEL_CAPACITY);
+        let (tx_proposal_header_requests, rx_proposal_header_requests) = channel(CHANNEL_CAPACITY);
         let (tx_instance, rx_instance) = channel(CHANNEL_CAPACITY);
         let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(CHANNEL_CAPACITY);
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
@@ -134,6 +136,7 @@ impl Primary {
                 tx_primary_messages,
                 tx_cert_requests,
                 tx_header_requests,
+                tx_proposal_header_requests,
             },
         );
         info!(
@@ -268,7 +271,13 @@ impl Primary {
         );
 
         // The `Helper` is dedicated to reply to certificates requests from other primaries.
-        Helper::spawn(committee.clone(), store, rx_cert_requests, rx_header_requests);
+        Helper::spawn(
+            committee.clone(),
+            store,
+            rx_cert_requests,
+            rx_header_requests,
+            rx_proposal_header_requests,
+        );
 
         // NOTE: This log entry is used to compute performance.
         info!(
@@ -289,6 +298,7 @@ struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
     tx_header_requests: Sender<(Vec<Digest>, PublicKey)>,
+    tx_proposal_header_requests: Sender<(Proposal, Height, PublicKey)>,
 }
 
 #[async_trait]
@@ -307,6 +317,11 @@ impl MessageHandler for PrimaryReceiverHandler {
             PrimaryMessage::HeadersRequest(missing, requestor) => self
                 .tx_header_requests
                 .send((missing, requestor))
+                .await
+                .expect("Failed to send primary message"),
+            PrimaryMessage::ProposalHeadersRequest(proposal, stop_height, requestor) => self
+                .tx_proposal_header_requests
+                .send((proposal, stop_height, requestor))
                 .await
                 .expect("Failed to send primary message"),
             request => {

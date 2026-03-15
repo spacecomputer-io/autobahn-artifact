@@ -4,7 +4,11 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
 use crate::messages::{ConsensusMessage, Header, Proposal, proposal_digest};
-use crate::metrics::DISSEMINATION_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL;
+use crate::metrics::{
+    DISSEMINATION_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL, DISSEMINATION_HOLE_DEPENDENTS,
+    DISSEMINATION_INFLIGHT_HOLES, DISSEMINATION_RECOVERED_HEADERS_TOTAL,
+    DISSEMINATION_SYNC_RETRIES_TOTAL,
+};
 use crate::primary::{Height, Slot, PrimaryMessage, PrimaryWorkerMessage};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
@@ -37,6 +41,8 @@ pub enum WaiterMessage {
     SyncProposals(Vec<Proposal>, ConsensusMessage, Header),
     SyncParent(Digest, Header),
     SyncHeader(Digest),
+    SyncCommittedProposal(Proposal, Height),
+    ClearCommittedProposalSync(Digest),
 }
 
 /// Waits for missing parent certificates and batches' digests.
@@ -84,6 +90,8 @@ pub struct HeaderWaiter {
     /// [F] Pending proposal sync requests ordered by slot, so lower slots get
     /// processed first. This is a simple Vec that we sort before draining.
     pending_proposal_syncs: Vec<PendingProposalSync>,
+    /// Commit-time suffix sync requests keyed by proposal digest.
+    proposal_sync_requests: HashMap<Digest, PendingSuffixSync>,
 }
 
 /// [F] Tracks a deferred proposal sync request with its consensus slot for priority ordering.
@@ -92,6 +100,13 @@ struct PendingProposalSync {
     missing: Vec<Proposal>,
     consensus_message: ConsensusMessage,
     header: Header,
+}
+
+#[derive(Clone)]
+struct PendingSuffixSync {
+    proposal: Proposal,
+    stop_height: Height,
+    timestamp: u128,
 }
 
 impl HeaderWaiter {
@@ -127,6 +142,7 @@ impl HeaderWaiter {
                 pending: HashMap::new(),
                 inflight_proposals: HashSet::new(),
                 pending_proposal_syncs: Vec::new(),
+                proposal_sync_requests: HashMap::new(),
             }
             .run()
             .await;
@@ -195,6 +211,18 @@ impl HeaderWaiter {
         for sync in syncs {
             self.execute_proposal_sync(sync.missing, sync.consensus_message, sync.header).await;
         }
+    }
+
+    fn update_recovery_metrics(&self) {
+        let mut inflight_holes = HashSet::new();
+        inflight_holes.extend(self.parent_requests.keys().cloned());
+        inflight_holes.extend(self.header_requests.keys().cloned());
+        inflight_holes.extend(self.batch_requests.keys().cloned());
+        inflight_holes.extend(self.proposal_sync_requests.keys().cloned());
+
+        DISSEMINATION_INFLIGHT_HOLES.set(inflight_holes.len() as i64);
+        DISSEMINATION_HOLE_DEPENDENTS
+            .set((self.pending.len() + self.pending_proposal_syncs.len()) as i64);
     }
 
     /// Execute a single proposal sync: register waiters and send network requests.
@@ -366,6 +394,46 @@ impl HeaderWaiter {
                             }
                         }
 
+                        WaiterMessage::SyncCommittedProposal(proposal, stop_height) => {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Failed to measure time")
+                                .as_millis();
+
+                            let is_new_request = !self
+                                .proposal_sync_requests
+                                .contains_key(&proposal.header_digest);
+                            self.proposal_sync_requests
+                                .entry(proposal.header_digest.clone())
+                                .or_insert_with(|| PendingSuffixSync {
+                                    proposal: proposal.clone(),
+                                    stop_height,
+                                    timestamp: now,
+                                });
+
+                            if is_new_request {
+                                let addresses: Vec<_> = self.committee
+                                    .others_primaries(&self.name)
+                                    .iter()
+                                    .map(|(_, x)| x.primary_to_primary)
+                                    .collect();
+                                let message = PrimaryMessage::ProposalHeadersRequest(
+                                    proposal,
+                                    stop_height,
+                                    self.name,
+                                );
+                                let bytes = bincode::serialize(&message)
+                                    .expect("Failed to serialize proposal suffix request");
+                                self.network
+                                    .lucky_broadcast(addresses, Bytes::from(bytes), INITIAL_SYNC_FANOUT)
+                                    .await;
+                            }
+                        }
+
+                        WaiterMessage::ClearCommittedProposalSync(digest) => {
+                            self.proposal_sync_requests.remove(&digest);
+                        }
+
                         WaiterMessage::SyncParent(missing, header) => {
                             debug!("Synching the parents of {}", header);
                             let header_id = header.id.clone();
@@ -438,6 +506,7 @@ impl HeaderWaiter {
                             let _ = self.batch_requests.remove(x);
                         }
                         let _ = self.parent_requests.remove(&header.parent_cert.header_digest);
+                        DISSEMINATION_RECOVERED_HEADERS_TOTAL.inc();
 
                         self.tx_core.send(header).await.expect("Failed to send header");
                     },
@@ -478,17 +547,56 @@ impl HeaderWaiter {
 
                     //Retry CertificateRequests
                     let mut retry = Vec::new();
-                    for (digest, (_, timestamp)) in &self.parent_requests {
-                        if timestamp + (self.sync_retry_delay as u128) < now {
+                    for (digest, (_, timestamp)) in self.parent_requests.iter_mut() {
+                        if *timestamp + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting retry sync for parent header {} (retry)", digest);
                             retry.push(digest.clone());
+                            *timestamp = now;
                         }
                     }
                     if !retry.is_empty() {
+                        DISSEMINATION_SYNC_RETRIES_TOTAL
+                            .with_label_values(&["parent"])
+                            .inc_by(retry.len() as u64);
                         let addresses = self.committee.others_primaries(&self.name).iter().map(|(_, x)| x.primary_to_primary).collect();
                         let message = PrimaryMessage::HeadersRequest(retry, self.name);
                         let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
                         self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
+                    }
+
+                    let mut suffix_retry = Vec::new();
+                    for request in self.proposal_sync_requests.values_mut() {
+                        if request.timestamp + (self.sync_retry_delay as u128) < now {
+                            request.timestamp = now;
+                            suffix_retry.push(request.clone());
+                        }
+                    }
+                    if !suffix_retry.is_empty() {
+                        DISSEMINATION_SYNC_RETRIES_TOTAL
+                            .with_label_values(&["suffix"])
+                            .inc_by(suffix_retry.len() as u64);
+                        let addresses: Vec<_> = self
+                            .committee
+                            .others_primaries(&self.name)
+                            .iter()
+                            .map(|(_, x)| x.primary_to_primary)
+                            .collect();
+                        for request in suffix_retry {
+                            let message = PrimaryMessage::ProposalHeadersRequest(
+                                request.proposal,
+                                request.stop_height,
+                                self.name,
+                            );
+                            let bytes = bincode::serialize(&message)
+                                .expect("Failed to serialize proposal suffix request");
+                            self.network
+                                .lucky_broadcast(
+                                    addresses.clone(),
+                                    Bytes::from(bytes),
+                                    self.sync_retry_nodes,
+                                )
+                                .await;
+                        }
                     }
 
                     // Reschedule the timer.
@@ -510,10 +618,13 @@ impl HeaderWaiter {
                 self.batch_requests.retain(|_, r| r > &mut gc_round);
                 self.parent_requests.retain(|_, (r, _)| r > &mut gc_round);
                 self.header_requests.retain(|_, (r, _)| r > &mut gc_round);
+                self.proposal_sync_requests
+                    .retain(|_, request| request.proposal.height > gc_round);
                 // [E1] Clean up inflight proposals that have been GC'd
                 // (We can't easily track heights here, so we just clear old entries
                 // when the set grows too large — the parent_requests dedup still works)
             }
+            self.update_recovery_metrics();
         }
     }
 }

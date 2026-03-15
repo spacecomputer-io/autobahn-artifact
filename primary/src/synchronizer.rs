@@ -6,7 +6,10 @@ use crate::{DagError, Height};
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
 use crate::messages::{Certificate, ConsensusMessage, Header, Proposal};
-use crate::metrics::DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL;
+use crate::metrics::{
+    CONSENSUS_COMMITTER_BLOCKED_TOTAL, CONSENSUS_COMMITTER_WAITS_TOTAL,
+    DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL,
+};
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
@@ -100,6 +103,14 @@ impl Synchronizer {
             .send(WaiterMessage::SyncHeader(header_digest))
             .await
             .expect("Failed to send sync special parent request");
+        Ok(())
+    }
+
+    pub async fn finish_committed_proposal_sync(&mut self, header_digest: Digest) -> DagResult<()> {
+        self.tx_header_waiter
+            .send(WaiterMessage::ClearCommittedProposalSync(header_digest))
+            .await
+            .expect("Failed to clear proposal suffix sync state");
         Ok(())
     }
 
@@ -259,6 +270,8 @@ impl Synchronizer {
         stop_height: Height,
     ) -> DagResult<Vec<Header>> {
         let mut ancestors: Vec<Header> = Vec::new();
+        let mut counted_header_block = false;
+        let mut suffix_requested = false;
 
         debug!("proposal height is {:?}", proposal.height);
 
@@ -267,11 +280,24 @@ impl Synchronizer {
             match self.get_header(proposal.header_digest.clone()).await? {
                 Some(h) => break h,
                 None => {
+                    if !counted_header_block {
+                        CONSENSUS_COMMITTER_BLOCKED_TOTAL.inc();
+                        counted_header_block = true;
+                    }
+                    CONSENSUS_COMMITTER_WAITS_TOTAL
+                        .with_label_values(&["header"])
+                        .inc();
                     debug!("Committer waiting for header {} at height {}", proposal.header_digest, proposal.height);
-                    self.tx_header_waiter
-                        .send(WaiterMessage::SyncHeader(proposal.header_digest.clone()))
-                        .await
-                        .expect("Failed to send sync header request");
+                    if !suffix_requested {
+                        self.tx_header_waiter
+                            .send(WaiterMessage::SyncCommittedProposal(
+                                proposal.clone(),
+                                stop_height,
+                            ))
+                            .await
+                            .expect("Failed to send proposal suffix request");
+                        suffix_requested = true;
+                    }
                     time::sleep(time::Duration::from_millis(50)).await;
                 }
             }
@@ -280,13 +306,54 @@ impl Synchronizer {
         let mut current_height = proposal.height;
         while current_height > stop_height {
             debug!("current height is {:?}, stop height is {:?}", current_height, stop_height);
+            let mut counted_payload_block = false;
+            while self.missing_payload(&header, true).await? {
+                if !counted_payload_block {
+                    CONSENSUS_COMMITTER_BLOCKED_TOTAL.inc();
+                    counted_payload_block = true;
+                }
+                CONSENSUS_COMMITTER_WAITS_TOTAL
+                    .with_label_values(&["payload"])
+                    .inc();
+                debug!(
+                    "Committer waiting for payload of header {} at height {}",
+                    header.id,
+                    header.height()
+                );
+                time::sleep(time::Duration::from_millis(50)).await;
+            }
             ancestors.push(header.clone());
+            let mut counted_parent_block = false;
             // Wait for parent header (may need background sync)
             header = loop {
-                match self.get_parent_header(&header).await? {
+                let next_parent = if header.parent_cert.header_digest
+                    == self.genesis_headers.get(&header.author).unwrap().digest()
+                {
+                    Some(self.genesis_headers.get(&header.author).unwrap().clone())
+                } else {
+                    self.get_header(header.parent_cert.header_digest.clone()).await?
+                };
+                match next_parent {
                     Some(h) => break h,
                     None => {
+                        if !counted_parent_block {
+                            CONSENSUS_COMMITTER_BLOCKED_TOTAL.inc();
+                            counted_parent_block = true;
+                        }
+                        CONSENSUS_COMMITTER_WAITS_TOTAL
+                            .with_label_values(&["parent"])
+                            .inc();
                         debug!("Committer waiting for parent of header at height {}", current_height);
+                        if !suffix_requested {
+                            self.tx_header_waiter
+                                .send(WaiterMessage::SyncCommittedProposal(
+                                    proposal.clone(),
+                                    stop_height,
+                                ))
+                                .await
+                                .expect("Failed to send proposal suffix request");
+                            suffix_requested = true;
+                        }
                         time::sleep(time::Duration::from_millis(50)).await;
                     }
                 }

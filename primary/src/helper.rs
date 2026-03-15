@@ -1,5 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::messages::Proposal;
 use crate::primary::PrimaryMessage;
+use crate::{Header, Height};
 use bytes::Bytes;
 use config::Committee;
 use crypto::{Digest, PublicKey};
@@ -26,6 +28,8 @@ pub struct Helper {
 
     /// Input channel to receive certificates requests.
     rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey)>,
+    /// Input channel to receive proposal suffix sync requests.
+    rx_proposal_headers: Receiver<(Proposal, Height, PublicKey)>,
     /// A network sender to reply to the sync requests.
     network: SimpleSender,
     /// Semaphore to bound concurrent response tasks.
@@ -38,6 +42,7 @@ impl Helper {
         store: Store,
         rx_primaries_certs: Receiver<(Vec<Digest>, PublicKey)>,
         rx_primaries_headers: Receiver<(Vec<Digest>, PublicKey)>,
+        rx_proposal_headers: Receiver<(Proposal, Height, PublicKey)>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -45,6 +50,7 @@ impl Helper {
                 store,
                 rx_primaries_certs,
                 rx_primaries_headers,
+                rx_proposal_headers,
                 network: SimpleSender::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RESPONSES)),
             }
@@ -130,6 +136,60 @@ impl Helper {
         }
     }
 
+    async fn serve_proposal_header_request(
+        store: Store,
+        network: &mut SimpleSender,
+        semaphore: Arc<Semaphore>,
+        proposal: Proposal,
+        stop_height: Height,
+        address: std::net::SocketAddr,
+    ) {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("Semaphore closed unexpectedly");
+        let mut store = store.clone();
+        let handle = tokio::spawn(async move {
+            let mut suffix = Vec::new();
+            let mut next_digest = proposal.header_digest.clone();
+
+            loop {
+                let bytes = match store.read(next_digest.to_vec()).await {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => break,
+                    Err(e) => return Err(e.to_string()),
+                };
+                let header: Header = match bincode::deserialize(&bytes) {
+                    Ok(header) => header,
+                    Err(e) => return Err(e.to_string()),
+                };
+                if header.height() <= stop_height {
+                    break;
+                }
+
+                next_digest = header.parent_cert.header_digest.clone();
+                suffix.push(header);
+            }
+
+            suffix.reverse();
+
+            drop(permit);
+            Ok::<Vec<Header>, String>(suffix)
+        });
+
+        match handle.await {
+            Ok(Ok(headers)) if !headers.is_empty() => {
+                let bytes = bincode::serialize(&PrimaryMessage::ProposalHeaders(headers))
+                    .expect("Failed to serialize proposal header suffix");
+                network.send(address, Bytes::from(bytes)).await;
+            }
+            Ok(Ok(_)) => (),
+            Ok(Err(e)) => error!("{}", e),
+            Err(e) => error!("Spawn join error: {}", e),
+        }
+    }
+
     async fn run(&mut self) {
         loop{
             tokio::select! {
@@ -172,6 +232,24 @@ impl Helper {
                         &mut self.network,
                         self.semaphore.clone(),
                         digests,
+                        address,
+                    ).await;
+                },
+                Some((proposal, stop_height, origin)) = self.rx_proposal_headers.recv() => {
+                    let address = match self.committee.primary(&origin) {
+                        Ok(x) => x.primary_to_primary,
+                        Err(e) => {
+                            warn!("Unexpected proposal header request: {}", e);
+                            continue;
+                        }
+                    };
+
+                    Self::serve_proposal_header_request(
+                        self.store.clone(),
+                        &mut self.network,
+                        self.semaphore.clone(),
+                        proposal,
+                        stop_height,
                         address,
                     ).await;
                 },
