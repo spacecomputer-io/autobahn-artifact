@@ -34,10 +34,16 @@ const TIMER_RESOLUTION: u64 = 1_000;
 /// Higher values get missing data faster at the cost of more network traffic.
 const INITIAL_SYNC_FANOUT: usize = 3;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PayloadSyncMode {
+    Live(bool),
+    Historical,
+}
+
 /// The commands that can be sent to the `Waiter`.
 #[derive(Debug)]
 pub enum WaiterMessage {
-    SyncBatches(HashMap<Digest, WorkerId>, Header, bool),
+    SyncBatches(HashMap<Digest, WorkerId>, Header, PayloadSyncMode),
     SyncProposals(Vec<Proposal>, ConsensusMessage, Header),
     SyncParent(Digest, Header),
     SyncHeader(Digest),
@@ -83,6 +89,10 @@ pub struct HeaderWaiter {
     /// List of digests (either certificates, headers or tx batch) that are waiting
     /// to be processed. Their processing will resume when we get all their dependencies.
     pending: HashMap<Digest, (Height, Sender<()>)>,
+    /// Headers whose payload waiters should not loop back through the live core path
+    /// when the missing batches arrive. These are historical/commit-recovery headers
+    /// that are already in the store and only need their payload to become available.
+    historical_payload_waiters: HashSet<Digest>,
     /// [E1] Tracks proposal header digests that are already being fetched,
     /// to avoid sending redundant sync requests when multiple consensus messages
     /// (e.g., Prepare for the same slot across different views) reference the same proposal.
@@ -148,6 +158,7 @@ impl HeaderWaiter {
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
                 pending: HashMap::new(),
+                historical_payload_waiters: HashSet::new(),
                 inflight_proposals: HashSet::new(),
                 pending_proposal_syncs: Vec::new(),
                 pending_commit_syncs: Vec::new(),
@@ -385,7 +396,7 @@ impl HeaderWaiter {
             tokio::select! {
                 Some(message) = self.rx_synchronizer.recv() => {
                     match message {
-                        WaiterMessage::SyncBatches(missing, header, force_sync) => {
+                        WaiterMessage::SyncBatches(missing, header, mode) => {
                             // Track sync request received
                             DISSEMINATION_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL.inc();
 
@@ -393,10 +404,18 @@ impl HeaderWaiter {
                             let header_id = header.id.clone();
                             let round = header.height;
                             let author = header.author;
+                            let force_sync = match mode {
+                                PayloadSyncMode::Live(force_sync) => force_sync,
+                                PayloadSyncMode::Historical => true,
+                            };
+                            let should_loopback = !matches!(mode, PayloadSyncMode::Historical);
 
                             // Ensure we sync only once per header waiter, but still allow
                             // commit-critical payload recovery to upgrade an existing wait.
                             if self.pending.contains_key(&header_id) {
+                                if should_loopback {
+                                    self.historical_payload_waiters.remove(&header_id);
+                                }
                                 if !force_sync {
                                     continue;
                                 }
@@ -411,9 +430,14 @@ impl HeaderWaiter {
                                     })
                                     .collect();
                                 let (tx_cancel, rx_cancel) = channel(1);
-                                self.pending.insert(header_id, (round, tx_cancel));
+                                self.pending.insert(header_id.clone(), (round, tx_cancel));
                                 let fut = Self::waiter(wait_for, header, rx_cancel);
                                 waiting.push(fut);
+                                if !should_loopback {
+                                    self.historical_payload_waiters.insert(header_id);
+                                } else {
+                                    self.historical_payload_waiters.remove(&header_id);
+                                }
                             }
 
                             if force_sync {
@@ -595,7 +619,9 @@ impl HeaderWaiter {
                         let _ = self.parent_requests.remove(&header.parent_cert.header_digest);
                         DISSEMINATION_RECOVERED_HEADERS_TOTAL.inc();
 
-                        self.tx_core.send(header).await.expect("Failed to send header");
+                        if !self.historical_payload_waiters.remove(&header.id) {
+                            self.tx_core.send(header).await.expect("Failed to send header");
+                        }
                     },
                     Ok(None) => {
                         // This request has been canceled.
@@ -708,6 +734,9 @@ impl HeaderWaiter {
                     self.parent_requests.keys().cloned().collect();
                 self.inflight_proposals
                     .retain(|digest| active_parent_requests.contains(digest));
+                let active_pending_headers: HashSet<_> = self.pending.keys().cloned().collect();
+                self.historical_payload_waiters
+                    .retain(|digest| active_pending_headers.contains(digest));
             }
             self.update_recovery_metrics();
         }

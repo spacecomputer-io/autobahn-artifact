@@ -4,14 +4,14 @@
 use crate::{DagError, Height};
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::DagResult;
-use crate::header_waiter::WaiterMessage;
+use crate::header_waiter::{PayloadSyncMode, WaiterMessage};
 use crate::messages::{Certificate, ConsensusMessage, Header, Proposal};
 use crate::metrics::{
     CONSENSUS_COMMITTER_BLOCKED_TOTAL, CONSENSUS_COMMITTER_WAITS_TOTAL,
     DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL,
 };
 use crate::primary::Slot;
-use config::Committee;
+use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::debug;
@@ -53,13 +53,13 @@ impl Synchronizer {
         }
     }
 
-    /// Returns `true` if we have all transactions of the payload. If we don't, we return false,
-    /// synchronize with other nodes (through our workers), and re-schedule processing of the
-    /// header for when we will have its complete payload.
-    pub async fn missing_payload(&mut self, header: &Header, force_sync: bool) -> DagResult<bool> {
+    async fn collect_missing_payload(
+        &mut self,
+        header: &Header,
+    ) -> DagResult<HashMap<Digest, WorkerId>> {
         // We don't store the payload of our own workers.
         if header.author == self.name {
-            return Ok(false);
+            return Ok(HashMap::new());
         }
 
         let mut missing = HashMap::new();
@@ -82,6 +82,19 @@ impl Synchronizer {
             }
         }
 
+        Ok(missing)
+    }
+
+    /// Returns `true` if we have all transactions of the payload. If we don't, we return false,
+    /// synchronize with other nodes (through our workers), and re-schedule processing of the
+    /// header for when we will have its complete payload.
+    async fn missing_payload_with_mode(
+        &mut self,
+        header: &Header,
+        mode: PayloadSyncMode,
+    ) -> DagResult<bool> {
+        let missing = self.collect_missing_payload(header).await?;
+
         if missing.is_empty() {
             return Ok(false);
         }
@@ -90,10 +103,24 @@ impl Synchronizer {
         DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL.inc();
 
         self.tx_header_waiter
-            .send(WaiterMessage::SyncBatches(missing, header.clone(), force_sync))
+            .send(WaiterMessage::SyncBatches(missing, header.clone(), mode))
             .await
             .expect("Failed to send sync batch request");
         Ok(true)
+    }
+
+    pub async fn payload_missing(&mut self, header: &Header) -> DagResult<bool> {
+        Ok(!self.collect_missing_payload(header).await?.is_empty())
+    }
+
+    pub async fn missing_payload(&mut self, header: &Header, force_sync: bool) -> DagResult<bool> {
+        self.missing_payload_with_mode(header, PayloadSyncMode::Live(force_sync))
+            .await
+    }
+
+    pub async fn missing_payload_historical(&mut self, header: &Header) -> DagResult<bool> {
+        self.missing_payload_with_mode(header, PayloadSyncMode::Historical)
+            .await
     }
 
     pub async fn fetch_header(&mut self, header_digest: Digest) -> DagResult<()> {
@@ -310,7 +337,12 @@ impl Synchronizer {
         while current_height > stop_height {
             debug!("current height is {:?}, stop height is {:?}", current_height, stop_height);
             let mut counted_payload_block = false;
-            while self.missing_payload(&header, true).await? {
+            let mut requested_payload_sync = false;
+            while self.payload_missing(&header).await? {
+                if !requested_payload_sync {
+                    self.missing_payload_historical(&header).await?;
+                    requested_payload_sync = true;
+                }
                 if !counted_payload_block {
                     CONSENSUS_COMMITTER_BLOCKED_TOTAL.inc();
                     counted_payload_block = true;

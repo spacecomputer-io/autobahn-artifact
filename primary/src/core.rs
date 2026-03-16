@@ -1919,18 +1919,14 @@ impl Core {
         for header in headers {
             match self.sanitize_header(&header) {
                 Ok(()) => {
-                    // Store recovered headers immediately so suffix sync unblocks ancestry lookup,
-                    // then separately drive payload recovery before execution can use them.
+                    // Store recovered headers immediately so suffix sync unblocks ancestry lookup.
+                    // Historical recovery should not re-enter the live header-processing path:
+                    // once their payload is synced, the committer can consume them directly from
+                    // storage without recreating consensus-side churn.
                     let bytes = bincode::serialize(&header).expect("Failed to serialize recovered header");
                     self.store.write(header.digest().to_vec(), bytes).await;
 
-                    if self.synchronizer.missing_payload(&header, true).await? {
-                        continue;
-                    }
-
-                    if let Err(e) = self.process_header(header, true).await {
-                        warn!("Failed to process recovered proposal header: {:?}", e);
-                    }
+                    let _ = self.synchronizer.missing_payload_historical(&header).await?;
                 }
                 error => {
                     warn!("Dropping recovered proposal header that failed sanitization: {:?}", error);
