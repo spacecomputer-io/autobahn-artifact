@@ -18,6 +18,7 @@ use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::process::Command;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
 use crate::metrics::WORKER_TRANSACTIONS_RECEIVED_TOTAL;
@@ -35,6 +36,23 @@ pub type Round = u64;
 
 /// Indicates a serialized `WorkerPrimaryMessage` message.
 pub type SerializedBatchDigestMessage = Vec<u8>;
+
+fn current_git_revision() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8(output.stdout).ok()?;
+    let revision = revision.trim();
+    if revision.is_empty() {
+        None
+    } else {
+        Some(revision.to_string())
+    }
+}
 
 /// The message exchanged between workers.
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,7 +92,16 @@ impl Worker {
         };
 
         // VERSION IDENTIFIER - Log version to verify which code is running
-        info!("🚀 WORKER {} VERSION: prometheus-metrics-csv-export-v2", id);
+        match current_git_revision() {
+            Some(revision) => info!(
+                "WORKER {} VERSION: prometheus-metrics-csv-export-v2 commit={}",
+                id, revision
+            ),
+            None => info!(
+                "WORKER {} VERSION: prometheus-metrics-csv-export-v2 commit=unknown",
+                id
+            ),
+        }
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
