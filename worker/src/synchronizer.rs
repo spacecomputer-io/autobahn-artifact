@@ -1,4 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::metrics::{
+    WORKER_SYNC_COMPLETIONS_TOTAL, WORKER_SYNC_PENDING_BATCHES, WORKER_SYNC_PENDING_DEPENDENTS,
+    WORKER_SYNC_RECOVERY_LATENCY_MS, WORKER_SYNC_REQUESTS_TOTAL, WORKER_SYNC_RETRIES_TOTAL,
+    WORKER_SYNC_TARGET_ROTATIONS_TOTAL,
+};
 use crate::worker::{Round, WorkerMessage};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
@@ -8,7 +13,7 @@ use futures::stream::StreamExt as _;
 use log::{debug, error};
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -23,7 +28,7 @@ const TIMER_RESOLUTION: u64 = 1_000;
 /// Minimum initial fanout for commit-critical batch recovery.
 const INITIAL_COMMITTED_SYNC_FANOUT: usize = 3;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
 enum SyncPriority {
     Background,
     CommitCritical,
@@ -33,8 +38,11 @@ struct PendingBatchSync {
     round: Round,
     cancel: Sender<()>,
     timestamp: u128,
+    first_request_timestamp: u128,
     target: PublicKey,
     priority: SyncPriority,
+    dependents: u64,
+    attempted_targets: HashSet<PublicKey>,
 }
 
 // The `Synchronizer` is responsible to keep the worker in sync with the others.
@@ -67,6 +75,80 @@ pub struct Synchronizer {
 }
 
 impl Synchronizer {
+    fn priority_label(priority: SyncPriority) -> &'static str {
+        match priority {
+            SyncPriority::Background => "background",
+            SyncPriority::CommitCritical => "commit_critical",
+        }
+    }
+
+    fn update_sync_metrics(&self) {
+        let mut background_batches = 0_i64;
+        let mut committed_batches = 0_i64;
+        let mut background_dependents = 0_i64;
+        let mut committed_dependents = 0_i64;
+
+        for request in self.pending.values() {
+            match request.priority {
+                SyncPriority::Background => {
+                    background_batches += 1;
+                    background_dependents += request.dependents as i64;
+                }
+                SyncPriority::CommitCritical => {
+                    committed_batches += 1;
+                    committed_dependents += request.dependents as i64;
+                }
+            }
+        }
+
+        WORKER_SYNC_PENDING_BATCHES
+            .with_label_values(&["background"])
+            .set(background_batches);
+        WORKER_SYNC_PENDING_BATCHES
+            .with_label_values(&["commit_critical"])
+            .set(committed_batches);
+        WORKER_SYNC_PENDING_DEPENDENTS
+            .with_label_values(&["background"])
+            .set(background_dependents);
+        WORKER_SYNC_PENDING_DEPENDENTS
+            .with_label_values(&["commit_critical"])
+            .set(committed_dependents);
+    }
+
+    fn candidate_targets(&self) -> Vec<PublicKey> {
+        self.committee
+            .others_workers(&self.name, &self.id)
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    fn select_retry_target_from_candidates(
+        candidates: &[PublicKey],
+        request: &mut PendingBatchSync,
+    ) -> PublicKey {
+        if !candidates.is_empty() && request.attempted_targets.len() >= candidates.len() {
+            request.attempted_targets.clear();
+            request.attempted_targets.insert(request.target.clone());
+        }
+
+        if let Some(next) = candidates
+            .iter()
+            .find(|candidate| {
+                **candidate != request.target && !request.attempted_targets.contains(*candidate)
+            })
+            .cloned()
+        {
+            return next;
+        }
+
+        candidates
+            .iter()
+            .find(|candidate| **candidate != request.target)
+            .cloned()
+            .unwrap_or_else(|| request.target.clone())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -124,6 +206,11 @@ impl Synchronizer {
             return;
         }
 
+        let phase = if retry { "retry" } else { "initial" };
+        WORKER_SYNC_REQUESTS_TOTAL
+            .with_label_values(&[Self::priority_label(priority), phase])
+            .inc_by(digests.len() as u64);
+
         let message = WorkerMessage::BatchRequest(digests, self.name);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
 
@@ -139,15 +226,30 @@ impl Synchronizer {
                 self.network.send(address, Bytes::from(serialized)).await;
             }
             (SyncPriority::Background, true) => {
-                let addresses: Vec<_> = self
+                let target_address = match self.committee.worker(&target, &self.id) {
+                    Ok(address) => address.worker_to_worker,
+                    Err(e) => {
+                        error!("The primary asked us to sync with an unknown node: {}", e);
+                        return;
+                    }
+                };
+                self.network
+                    .send(target_address, Bytes::from(serialized.clone()))
+                    .await;
+
+                let other_addresses: Vec<_> = self
                     .committee
                     .others_workers(&self.name, &self.id)
                     .iter()
+                    .filter(|(name, _)| *name != target)
                     .map(|(_, address)| address.worker_to_worker)
                     .collect();
-                self.network
-                    .lucky_broadcast(addresses, Bytes::from(serialized), self.sync_retry_nodes)
-                    .await;
+                if !other_addresses.is_empty() {
+                    let fanout = other_addresses.len().min(self.sync_retry_nodes);
+                    self.network
+                        .lucky_broadcast(other_addresses, Bytes::from(serialized), fanout)
+                        .await;
+                }
             }
             (SyncPriority::CommitCritical, false) => {
                 let target_address = match self.committee.worker(&target, &self.id) {
@@ -179,16 +281,32 @@ impl Synchronizer {
                 }
             }
             (SyncPriority::CommitCritical, true) => {
-                let addresses: Vec<_> = self
+                let target_address = match self.committee.worker(&target, &self.id) {
+                    Ok(address) => address.worker_to_worker,
+                    Err(e) => {
+                        error!("The primary asked us to sync with an unknown node: {}", e);
+                        return;
+                    }
+                };
+                self.network
+                    .send(target_address, Bytes::from(serialized.clone()))
+                    .await;
+
+                let other_addresses: Vec<_> = self
                     .committee
                     .others_workers(&self.name, &self.id)
                     .iter()
+                    .filter(|(name, _)| *name != target)
                     .map(|(_, address)| address.worker_to_worker)
                     .collect();
 
-                if !addresses.is_empty() {
+                if !other_addresses.is_empty() {
                     self.network
-                        .lucky_broadcast(addresses.clone(), Bytes::from(serialized), addresses.len())
+                        .lucky_broadcast(
+                            other_addresses.clone(),
+                            Bytes::from(serialized),
+                            other_addresses.len(),
+                        )
                         .await;
                 }
             }
@@ -216,11 +334,13 @@ impl Synchronizer {
                         let mut missing = Vec::new();
                         for digest in digests {
                             if let Some(existing) = self.pending.get_mut(&digest) {
+                                existing.dependents += 1;
+                                existing.attempted_targets.insert(target.clone());
                                 if priority == SyncPriority::CommitCritical
                                     && existing.priority != SyncPriority::CommitCritical
                                 {
                                     existing.priority = SyncPriority::CommitCritical;
-                                    existing.target = target;
+                                    existing.target = target.clone();
                                     existing.timestamp = now;
                                     missing.push(digest.clone());
                                 }
@@ -249,13 +369,17 @@ impl Synchronizer {
                                     round: self.round,
                                     cancel: tx_cancel,
                                     timestamp: now,
-                                    target,
+                                    first_request_timestamp: now,
+                                    target: target.clone(),
                                     priority,
+                                    dependents: 1,
+                                    attempted_targets: HashSet::from([target.clone()]),
                                 },
                             );
                         }
 
                         self.send_sync_request(missing, target, priority, false).await;
+                        self.update_sync_metrics();
                     }
                     PrimaryWorkerMessage::SynchronizeCommitted(digests, target) => {
                         let priority = SyncPriority::CommitCritical;
@@ -269,11 +393,13 @@ impl Synchronizer {
                             // Ensure we do not send twice the same sync request, but
                             // allow commit-critical recovery to upgrade an existing wait.
                             if let Some(existing) = self.pending.get_mut(&digest) {
+                                existing.dependents += 1;
+                                existing.attempted_targets.insert(target.clone());
                                 if priority == SyncPriority::CommitCritical
                                     && existing.priority != SyncPriority::CommitCritical
                                 {
                                     existing.priority = SyncPriority::CommitCritical;
-                                    existing.target = target;
+                                    existing.target = target.clone();
                                     existing.timestamp = now;
                                     missing.push(digest.clone());
                                 }
@@ -306,13 +432,17 @@ impl Synchronizer {
                                     round: self.round,
                                     cancel: tx_cancel,
                                     timestamp: now,
-                                    target,
+                                    first_request_timestamp: now,
+                                    target: target.clone(),
                                     priority,
+                                    dependents: 1,
+                                    attempted_targets: HashSet::from([target.clone()]),
                                 },
                             );
                         }
 
                         self.send_sync_request(missing, target, priority, false).await;
+                        self.update_sync_metrics();
                     }
                     PrimaryWorkerMessage::Cleanup(round) => {
                         // Keep track of the primary's round number.
@@ -330,6 +460,7 @@ impl Synchronizer {
                             }
                         }
                         self.pending.retain(|_, request| request.round > gc_round);
+                        self.update_sync_metrics();
                     }
                 },
 
@@ -337,7 +468,20 @@ impl Synchronizer {
                 Some(result) = waiting.next() => match result {
                     Ok(Some(digest)) => {
                         // We got the batch, remove it from the pending list.
-                        self.pending.remove(&digest);
+                        if let Some(request) = self.pending.remove(&digest) {
+                            WORKER_SYNC_COMPLETIONS_TOTAL
+                                .with_label_values(&[Self::priority_label(request.priority)])
+                                .inc();
+                            let latency_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Failed to measure time")
+                                .as_millis()
+                                .saturating_sub(request.first_request_timestamp);
+                            WORKER_SYNC_RECOVERY_LATENCY_MS
+                                .with_label_values(&[Self::priority_label(request.priority)])
+                                .observe(latency_ms as f64);
+                        }
+                        self.update_sync_metrics();
                     },
                     Ok(None) => {
                         // The sync request for this batch has been canceled.
@@ -354,57 +498,40 @@ impl Synchronizer {
                         .duration_since(UNIX_EPOCH)
                         .expect("Failed to measure time")
                         .as_millis();
+                    let candidate_targets = self.candidate_targets();
 
-                    let mut retry_background = Vec::new();
-                    let mut retry_committed = Vec::new();
+                    let mut retry_groups: HashMap<(SyncPriority, PublicKey), Vec<Digest>> =
+                        HashMap::new();
                     for (digest, request) in &mut self.pending {
                         if request.timestamp + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting sync for batch {} (retry)", digest);
                             request.timestamp = now;
-                            if request.priority == SyncPriority::CommitCritical {
-                                retry_committed.push((digest.clone(), request.target));
-                            } else {
-                                retry_background.push((digest.clone(), request.target));
+                            let next_target =
+                                Self::select_retry_target_from_candidates(&candidate_targets, request);
+                            if next_target != request.target {
+                                WORKER_SYNC_TARGET_ROTATIONS_TOTAL
+                                    .with_label_values(&[Self::priority_label(request.priority)])
+                                    .inc();
                             }
+                            request.target = next_target.clone();
+                            request.attempted_targets.insert(next_target.clone());
+                            WORKER_SYNC_RETRIES_TOTAL
+                                .with_label_values(&[Self::priority_label(request.priority)])
+                                .inc();
+                            retry_groups
+                                .entry((request.priority, next_target))
+                                .or_default()
+                                .push(digest.clone());
                         }
                     }
 
-                    let retry_background_digests: Vec<_> =
-                        retry_background.into_iter().map(|(digest, _)| digest).collect();
-                    if !retry_background_digests.is_empty() {
-                        let target = self
-                            .pending
-                            .get(&retry_background_digests[0])
-                            .map(|request| request.target)
-                            .unwrap_or(self.name);
-                        self.send_sync_request(
-                            retry_background_digests,
-                            target,
-                            SyncPriority::Background,
-                            true,
-                        )
-                        .await;
-                    }
-
-                    let retry_committed_digests: Vec<_> =
-                        retry_committed.into_iter().map(|(digest, _)| digest).collect();
-                    if !retry_committed_digests.is_empty() {
-                        let target = self
-                            .pending
-                            .get(&retry_committed_digests[0])
-                            .map(|request| request.target)
-                            .unwrap_or(self.name);
-                        self.send_sync_request(
-                            retry_committed_digests,
-                            target,
-                            SyncPriority::CommitCritical,
-                            true,
-                        )
-                        .await;
+                    for ((priority, target), digests) in retry_groups {
+                        self.send_sync_request(digests, target, priority, true).await;
                     }
 
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
+                    self.update_sync_metrics();
                 },
             }
         }

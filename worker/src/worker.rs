@@ -3,6 +3,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
+use crate::metrics::WORKER_SYNC_CHANNEL_BACKPRESSURE_TOTAL;
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
 use crate::quorum_waiter::QuorumWaiter;
@@ -330,11 +331,19 @@ impl MessageHandler for PrimaryReceiverHandler {
         // Deserialize the message and send it to the synchronizer.
         match bincode::deserialize(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(message) => self             
-                .tx_synchronizer
-                .send(message)
-                .await
-                .expect("Failed to send transaction"),
+            Ok(message) => match self.tx_synchronizer.try_send(message) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
+                    WORKER_SYNC_CHANNEL_BACKPRESSURE_TOTAL.inc();
+                    self.tx_synchronizer
+                        .send(message)
+                        .await
+                        .expect("Failed to send transaction");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("Failed to send transaction");
+                }
+            },
         }
         Ok(())
     }
