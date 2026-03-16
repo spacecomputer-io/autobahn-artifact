@@ -97,5 +97,12 @@ lazy_static! {
             "Total number of times the worker synchronizer channel was observed full"
         )
         .expect("failed to register worker_sync_channel_backpressure_total");
-}
 
+    pub static ref WORKER_SYNC_GC_EVICTIONS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "worker_sync_gc_evictions_total",
+            "Total number of pending worker batch syncs evicted by round-based GC",
+            &["priority"]
+        )
+        .expect("failed to register worker_sync_gc_evictions_total");
+}

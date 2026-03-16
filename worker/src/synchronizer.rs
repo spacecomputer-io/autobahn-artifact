@@ -2,7 +2,7 @@
 use crate::metrics::{
     WORKER_SYNC_COMPLETIONS_TOTAL, WORKER_SYNC_PENDING_BATCHES, WORKER_SYNC_PENDING_DEPENDENTS,
     WORKER_SYNC_RECOVERY_LATENCY_MS, WORKER_SYNC_REQUESTS_TOTAL, WORKER_SYNC_RETRIES_TOTAL,
-    WORKER_SYNC_TARGET_ROTATIONS_TOTAL,
+    WORKER_SYNC_TARGET_ROTATIONS_TOTAL, WORKER_SYNC_GC_EVICTIONS_TOTAL,
 };
 use crate::worker::{Round, WorkerMessage};
 use bytes::Bytes;
@@ -453,13 +453,34 @@ impl Synchronizer {
                             continue;
                         }
 
-                        let mut gc_round = self.round - self.gc_depth;
-                        for request in self.pending.values() {
-                            if request.round <= gc_round {
-                                let _ = request.cancel.send(()).await;
+                        let gc_round = self.round - self.gc_depth;
+                        let mut evicted = HashSet::new();
+                        for (digest, request) in &self.pending {
+                            // Commit-critical batch recovery must outlive round GC. The committer
+                            // may still be blocked on these payloads hundreds of rounds later,
+                            // and the primary currently issues only one historical sync request
+                            // per missing header before polling local storage.
+                            if request.priority == SyncPriority::Background
+                                && request.round <= gc_round
+                            {
+                                evicted.insert(digest.clone());
                             }
                         }
-                        self.pending.retain(|_, request| request.round > gc_round);
+                        for digest in &evicted {
+                            let request = self
+                                .pending
+                                .get(digest)
+                                .expect("gc eviction digest should remain pending during cleanup");
+                            WORKER_SYNC_GC_EVICTIONS_TOTAL
+                                .with_label_values(&[Self::priority_label(request.priority)])
+                                .inc();
+                            let _ = request.cancel.clone().send(()).await;
+                        }
+                        self.pending.retain(|digest, request| {
+                            request.priority == SyncPriority::CommitCritical
+                                || request.round > gc_round
+                                || !evicted.contains(digest)
+                        });
                         self.update_sync_metrics();
                     }
                 },
