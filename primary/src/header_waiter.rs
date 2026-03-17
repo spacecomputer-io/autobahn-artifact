@@ -19,6 +19,8 @@ use futures::stream::StreamExt as _;
 use log::{debug, warn, error};
 use network::SimpleSender;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,6 +40,24 @@ const INITIAL_SYNC_FANOUT: usize = 3;
 pub enum PayloadSyncMode {
     Live(bool),
     Historical,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncPriority {
+    Background,
+    CommitCritical,
+}
+
+#[derive(Clone)]
+struct SyncRequestState {
+    round: Height,
+    timestamp: u128,
+    priority: SyncPriority,
+}
+
+enum WaitOutcome {
+    Header(Header),
+    ParentReady(Digest),
 }
 
 /// The commands that can be sent to the `Waiter`.
@@ -80,15 +100,20 @@ pub struct HeaderWaiter {
 
     /// Keeps the digests of the all certificates for which we sent a sync request,
     /// along with a timestamp (`u128`) indicating when we sent the request.
-    parent_requests: HashMap<Digest, (Height, u128)>,
+    parent_requests: HashMap<Digest, SyncRequestState>,
     //same, but for special parents
-    header_requests: HashMap<Digest, (Height, u128)>,
+    header_requests: HashMap<Digest, SyncRequestState>,
     /// Keeps the digests of the all tx batches for which we sent a sync request,
     /// similarly to `header_requests`.
     batch_requests: HashMap<Digest, (Height, bool)>,
     /// List of digests (either certificates, headers or tx batch) that are waiting
     /// to be processed. Their processing will resume when we get all their dependencies.
     pending: HashMap<Digest, (Height, Sender<()>)>,
+    /// Shared parent-hole dependents keyed by the missing parent digest. Multiple headers
+    /// waiting on the same parent attach here instead of creating duplicate waiters.
+    parent_dependents: HashMap<Digest, Vec<Header>>,
+    /// Cancel handles for shared parent-hole waiters.
+    parent_waiters: HashMap<Digest, Sender<()>>,
     /// Headers whose payload waiters should not loop back through the live core path
     /// when the missing batches arrive. These are historical/commit-recovery headers
     /// that are already in the store and only need their payload to become available.
@@ -158,6 +183,8 @@ impl HeaderWaiter {
                 header_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
                 pending: HashMap::new(),
+                parent_dependents: HashMap::new(),
+                parent_waiters: HashMap::new(),
                 historical_payload_waiters: HashSet::new(),
                 inflight_proposals: HashSet::new(),
                 pending_proposal_syncs: Vec::new(),
@@ -175,14 +202,31 @@ impl HeaderWaiter {
         mut missing: Vec<(Vec<u8>, Store)>,
         deliver: Header,
         mut handler: Receiver<()>,
-    ) -> DagResult<Option<Header>> {
+    ) -> DagResult<Option<WaitOutcome>> {
         let waiting: Vec<_> = missing
             .iter_mut()
             .map(|(x, y)| y.notify_read(x.to_vec()))
             .collect();
         tokio::select! {
             result = try_join_all(waiting) => {
-                result.map(|_| Some(deliver)).map_err(DagError::from)
+                result
+                    .map(|_| Some(WaitOutcome::Header(deliver)))
+                    .map_err(DagError::from)
+            }
+            _ = handler.recv() => Ok(None),
+        }
+    }
+
+    async fn parent_waiter(
+        missing: Digest,
+        mut store: Store,
+        mut handler: Receiver<()>,
+    ) -> DagResult<Option<WaitOutcome>> {
+        tokio::select! {
+            result = store.notify_read(missing.to_vec()) => {
+                result
+                    .map(|_| Some(WaitOutcome::ParentReady(missing)))
+                    .map_err(DagError::from)
             }
             _ = handler.recv() => Ok(None),
         }
@@ -242,7 +286,18 @@ impl HeaderWaiter {
 
         DISSEMINATION_INFLIGHT_HOLES.set(inflight_holes.len() as i64);
         DISSEMINATION_HOLE_DEPENDENTS
-            .set((self.pending.len() + self.pending_proposal_syncs.len() + self.pending_commit_syncs.len()) as i64);
+            .set(
+                (
+                    self.pending.len()
+                        + self.pending_proposal_syncs.len()
+                        + self.pending_commit_syncs.len()
+                        + self
+                            .parent_dependents
+                            .values()
+                            .map(Vec::len)
+                            .sum::<usize>()
+                ) as i64,
+            );
     }
 
     fn certifier_addresses(&self, proposal: &Proposal) -> Vec<std::net::SocketAddr> {
@@ -360,14 +415,31 @@ impl HeaderWaiter {
         for proposal in &missing {
             // [E1] Skip if we're already fetching this proposal header
             if self.inflight_proposals.contains(&proposal.header_digest) {
+                if let Some(request) = self.parent_requests.get_mut(&proposal.header_digest) {
+                    request.round = request.round.max(proposal.height);
+                    request.priority = SyncPriority::CommitCritical;
+                    request.timestamp = now;
+                }
                 continue;
             }
             self.inflight_proposals.insert(proposal.header_digest.clone());
 
-            self.parent_requests.entry(proposal.header_digest.clone()).or_insert_with(|| {
-                requires_sync.push(proposal.header_digest.clone());
-                (proposal.height, now)
-            });
+            match self.parent_requests.entry(proposal.header_digest.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let request = entry.get_mut();
+                    request.round = request.round.max(proposal.height);
+                    request.priority = SyncPriority::CommitCritical;
+                    request.timestamp = now;
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    requires_sync.push(proposal.header_digest.clone());
+                    entry.insert(SyncRequestState {
+                        round: proposal.height,
+                        timestamp: now,
+                        priority: SyncPriority::CommitCritical,
+                    });
+                }
+            }
         }
         if !requires_sync.is_empty() {
             // [E2] Fan out to multiple nodes instead of just the author.
@@ -387,7 +459,9 @@ impl HeaderWaiter {
 
     /// Main loop listening to the `Synchronizer` messages.
     async fn run(&mut self) {
-        let mut waiting = FuturesUnordered::new();
+        let mut waiting: FuturesUnordered<
+            Pin<Box<dyn Future<Output = DagResult<Option<WaitOutcome>>> + Send>>,
+        > = FuturesUnordered::new();
 
         let timer = sleep(Duration::from_millis(TIMER_RESOLUTION));
         tokio::pin!(timer);
@@ -432,7 +506,7 @@ impl HeaderWaiter {
                                 let (tx_cancel, rx_cancel) = channel(1);
                                 self.pending.insert(header_id.clone(), (round, tx_cancel));
                                 let fut = Self::waiter(wait_for, header, rx_cancel);
-                                waiting.push(fut);
+                                waiting.push(Box::pin(fut));
                                 if !should_loopback {
                                     self.historical_payload_waiters.insert(header_id);
                                 } else {
@@ -484,10 +558,23 @@ impl HeaderWaiter {
                             let round = self.consensus_round.load(Ordering::Relaxed);
 
                             let mut requires_sync = Vec::new();
-                            self.header_requests.entry(missing.clone()).or_insert_with(|| {
-                                requires_sync.push(missing);
-                                (round, now)
-                            });
+                            match self.header_requests.entry(missing.clone()) {
+                                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                    let request = entry.get_mut();
+                                    request.round = request.round.max(round);
+                                    request.priority = SyncPriority::CommitCritical;
+                                    request.timestamp = now;
+                                    requires_sync.push(missing);
+                                }
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    requires_sync.push(missing);
+                                    entry.insert(SyncRequestState {
+                                        round,
+                                        timestamp: now,
+                                        priority: SyncPriority::CommitCritical,
+                                    });
+                                }
+                            }
 
                             if !requires_sync.is_empty() {
                                 let addresses = self.committee
@@ -510,17 +597,16 @@ impl HeaderWaiter {
                                 .as_millis();
 
                             let digest = proposal.header_digest.clone();
-                            let mut queue_request = false;
+                            let queue_request = true;
                             match self.proposal_sync_requests.get_mut(&digest) {
                                 Some(request) => {
                                     if slot < request.slot {
                                         request.slot = slot;
-                                        queue_request = true;
                                     }
                                     if stop_height < request.stop_height {
                                         request.stop_height = stop_height;
-                                        queue_request = true;
                                     }
+                                    request.timestamp = now;
                                 }
                                 None => {
                                     self.proposal_sync_requests.insert(
@@ -532,7 +618,6 @@ impl HeaderWaiter {
                                             timestamp: now,
                                         },
                                     );
-                                    queue_request = true;
                                 }
                             }
 
@@ -548,35 +633,34 @@ impl HeaderWaiter {
 
                         WaiterMessage::SyncParent(missing, header) => {
                             debug!("Synching the parents of {}", header);
-                            let header_id = header.id.clone();
                             let height = header.height();
-                            let author = header.author;
-
-                            // Ensure we sync only once per header.
-                            if self.pending.contains_key(&header_id) {
-                                continue;
-                            }
-
-                            // Add the header to the waiter pool. The waiter will return it to us
-                            // when all its parents are in the store.
-                            let mut wait_for = Vec::new();
-                            wait_for.push((missing.to_vec(), self.store.clone()));
-                            let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(header_id, (height, tx_cancel));
-                            let fut = Self::waiter(wait_for, header, rx_cancel);
-                            waiting.push(fut);
-
-                            // Ensure we didn't already sent a sync request for these parents.
-                            // [E2] Send to multiple nodes instead of just the author for faster response.
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .expect("Failed to measure time")
                                 .as_millis();
+                            let request = self
+                                .parent_requests
+                                .entry(missing.clone())
+                                .or_insert_with(|| SyncRequestState {
+                                    round: height,
+                                    timestamp: now,
+                                    priority: SyncPriority::Background,
+                                });
+                            request.round = request.round.max(height);
+
+                            let dependents = self.parent_dependents.entry(missing.clone()).or_default();
+                            if !dependents.iter().any(|dependent| dependent.id == header.id) {
+                                dependents.push(header);
+                            }
+
                             let mut requires_sync = Vec::new();
-                            self.parent_requests.entry(missing.clone()).or_insert_with(|| {
-                                requires_sync.push(missing);
-                                (height, now)
-                            });
+                            if !self.parent_waiters.contains_key(&missing) {
+                                let (tx_cancel, rx_cancel) = channel(1);
+                                self.parent_waiters.insert(missing.clone(), tx_cancel);
+                                let fut = Self::parent_waiter(missing.clone(), self.store.clone(), rx_cancel);
+                                waiting.push(Box::pin(fut));
+                                requires_sync.push(missing.clone());
+                            }
                             if !requires_sync.is_empty() {
                                 let addresses: Vec<_> = self.committee
                                     .others_primaries(&self.name)
@@ -611,7 +695,7 @@ impl HeaderWaiter {
                 },
 
                 Some(result) = waiting.next() => match result {
-                    Ok(Some(header)) => {
+                    Ok(Some(WaitOutcome::Header(header))) => {
                         debug!("Finished synching {:?}", header);
                         let _ = self.pending.remove(&header.id);
                         for x in header.payload.keys() {
@@ -622,6 +706,19 @@ impl HeaderWaiter {
 
                         if !self.historical_payload_waiters.remove(&header.id) {
                             self.tx_core.send(header).await.expect("Failed to send header");
+                        }
+                    },
+                    Ok(Some(WaitOutcome::ParentReady(digest))) => {
+                        debug!("Finished synching missing parent {}", digest);
+                        self.parent_waiters.remove(&digest);
+                        self.parent_requests.remove(&digest);
+                        if let Some(headers) = self.parent_dependents.remove(&digest) {
+                            for header in headers {
+                                self.tx_core
+                                    .send(header)
+                                    .await
+                                    .expect("Failed to send header after parent recovery");
+                            }
                         }
                     },
                     Ok(None) => {
@@ -653,11 +750,11 @@ impl HeaderWaiter {
 
                     //Retry CertificateRequests
                     let mut retry = Vec::new();
-                    for (digest, (_, timestamp)) in self.parent_requests.iter_mut() {
-                        if *timestamp + (self.sync_retry_delay as u128) < now {
+                    for (digest, request) in self.parent_requests.iter_mut() {
+                        if request.timestamp + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting retry sync for parent header {} (retry)", digest);
                             retry.push(digest.clone());
-                            *timestamp = now;
+                            request.timestamp = now;
                         }
                     }
                     if !retry.is_empty() {
@@ -671,11 +768,11 @@ impl HeaderWaiter {
                     }
 
                     let mut header_retry = Vec::new();
-                    for (digest, (_, timestamp)) in self.header_requests.iter_mut() {
-                        if *timestamp + (self.sync_retry_delay as u128) < now {
+                    for (digest, request) in self.header_requests.iter_mut() {
+                        if request.timestamp + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting retry sync for header {} (retry)", digest);
                             header_retry.push(digest.clone());
-                            *timestamp = now;
+                            request.timestamp = now;
                         }
                     }
                     if !header_retry.is_empty() {
@@ -748,8 +845,26 @@ impl HeaderWaiter {
                 }
                 self.pending.retain(|_, (r, _)| r > &mut gc_round);
                 self.batch_requests.retain(|_, (r, _)| r > &mut gc_round);
-                self.parent_requests.retain(|_, (r, _)| r > &mut gc_round);
-                self.header_requests.retain(|_, (r, _)| r > &mut gc_round);
+                let evicted_parent_digests: Vec<_> = self
+                    .parent_requests
+                    .iter()
+                    .filter_map(|(digest, request)| {
+                        (request.priority == SyncPriority::Background && request.round <= gc_round)
+                            .then_some(digest.clone())
+                    })
+                    .collect();
+                for digest in &evicted_parent_digests {
+                    if let Some(cancel) = self.parent_waiters.remove(digest) {
+                        let _ = cancel.send(()).await;
+                    }
+                    self.parent_dependents.remove(digest);
+                }
+                self.parent_requests.retain(|_, request| {
+                    request.priority == SyncPriority::CommitCritical || request.round > gc_round
+                });
+                self.header_requests.retain(|_, request| {
+                    request.priority == SyncPriority::CommitCritical || request.round > gc_round
+                });
                 // Keep only proposal digests that still have outstanding header fetch state.
                 let active_parent_requests: HashSet<_> =
                     self.parent_requests.keys().cloned().collect();
