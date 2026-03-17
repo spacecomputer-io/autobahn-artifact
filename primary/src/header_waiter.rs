@@ -478,14 +478,15 @@ impl HeaderWaiter {
                             debug!("Syncing on header with digest {}", missing);
 
                             let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .expect("Failed to measure time")
-                            .as_millis();
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Failed to measure time")
+                                .as_millis();
+                            let round = self.consensus_round.load(Ordering::Relaxed);
 
                             let mut requires_sync = Vec::new();
                             self.header_requests.entry(missing.clone()).or_insert_with(|| {
                                 requires_sync.push(missing);
-                                (0, now)
+                                (round, now)
                             });
 
                             if !requires_sync.is_empty() {
@@ -669,6 +670,32 @@ impl HeaderWaiter {
                         self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
                     }
 
+                    let mut header_retry = Vec::new();
+                    for (digest, (_, timestamp)) in self.header_requests.iter_mut() {
+                        if *timestamp + (self.sync_retry_delay as u128) < now {
+                            debug!("Requesting retry sync for header {} (retry)", digest);
+                            header_retry.push(digest.clone());
+                            *timestamp = now;
+                        }
+                    }
+                    if !header_retry.is_empty() {
+                        DISSEMINATION_SYNC_RETRIES_TOTAL
+                            .with_label_values(&["header"])
+                            .inc_by(header_retry.len() as u64);
+                        let addresses = self
+                            .committee
+                            .others_primaries(&self.name)
+                            .iter()
+                            .map(|(_, x)| x.primary_to_primary)
+                            .collect();
+                        let message = PrimaryMessage::HeadersRequest(header_retry, self.name);
+                        let bytes =
+                            bincode::serialize(&message).expect("Failed to serialize cert request");
+                        self.network
+                            .lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes)
+                            .await;
+                    }
+
                     let mut suffix_retry = Vec::new();
                     for request in self.proposal_sync_requests.values_mut() {
                         if request.timestamp + (self.sync_retry_delay as u128) < now {
@@ -723,12 +750,6 @@ impl HeaderWaiter {
                 self.batch_requests.retain(|_, (r, _)| r > &mut gc_round);
                 self.parent_requests.retain(|_, (r, _)| r > &mut gc_round);
                 self.header_requests.retain(|_, (r, _)| r > &mut gc_round);
-                self.proposal_sync_requests
-                    .retain(|_, request| request.proposal.height > gc_round);
-                let active_proposal_syncs: HashSet<_> =
-                    self.proposal_sync_requests.keys().cloned().collect();
-                self.pending_commit_syncs
-                    .retain(|pending| active_proposal_syncs.contains(&pending.digest));
                 // Keep only proposal digests that still have outstanding header fetch state.
                 let active_parent_requests: HashSet<_> =
                     self.parent_requests.keys().cloned().collect();

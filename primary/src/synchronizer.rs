@@ -20,6 +20,8 @@ use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time;
 
+const COMMITTER_RECOVERY_RETRY_BACKOFF_MS: u64 = 5_000;
+
 /// The `Synchronizer` checks if we have all batches and parents referenced by a header. If we don't, it sends
 /// a command to the `Waiter` to request the missing data.
 #[derive(Clone)]
@@ -300,7 +302,7 @@ impl Synchronizer {
     ) -> DagResult<Vec<Header>> {
         let mut ancestors: Vec<Header> = Vec::new();
         let mut counted_header_block = false;
-        let mut suffix_requested = false;
+        let mut last_suffix_request_at: Option<time::Instant> = None;
 
         debug!("proposal height is {:?}", proposal.height);
 
@@ -317,7 +319,13 @@ impl Synchronizer {
                         .with_label_values(&["header"])
                         .inc();
                     debug!("Committer waiting for header {} at height {}", proposal.header_digest, proposal.height);
-                    if !suffix_requested {
+                    let should_retry_suffix = last_suffix_request_at
+                        .map(|timestamp| {
+                            timestamp.elapsed()
+                                >= time::Duration::from_millis(COMMITTER_RECOVERY_RETRY_BACKOFF_MS)
+                        })
+                        .unwrap_or(true);
+                    if should_retry_suffix {
                         self.tx_header_waiter
                             .send(WaiterMessage::SyncCommittedProposal(
                                 proposal.clone(),
@@ -326,7 +334,7 @@ impl Synchronizer {
                             ))
                             .await
                             .expect("Failed to send proposal suffix request");
-                        suffix_requested = true;
+                        last_suffix_request_at = Some(time::Instant::now());
                     }
                     time::sleep(time::Duration::from_millis(50)).await;
                 }
@@ -337,11 +345,17 @@ impl Synchronizer {
         while current_height > stop_height {
             debug!("current height is {:?}, stop height is {:?}", current_height, stop_height);
             let mut counted_payload_block = false;
-            let mut requested_payload_sync = false;
+            let mut last_payload_sync_at: Option<time::Instant> = None;
             while self.payload_missing(&header).await? {
-                if !requested_payload_sync {
+                let should_retry_payload = last_payload_sync_at
+                    .map(|timestamp| {
+                        timestamp.elapsed()
+                            >= time::Duration::from_millis(COMMITTER_RECOVERY_RETRY_BACKOFF_MS)
+                    })
+                    .unwrap_or(true);
+                if should_retry_payload {
                     self.missing_payload_historical(&header).await?;
-                    requested_payload_sync = true;
+                    last_payload_sync_at = Some(time::Instant::now());
                 }
                 if !counted_payload_block {
                     CONSENSUS_COMMITTER_BLOCKED_TOTAL.inc();
@@ -379,7 +393,13 @@ impl Synchronizer {
                             .with_label_values(&["parent"])
                             .inc();
                         debug!("Committer waiting for parent of header at height {}", current_height);
-                        if !suffix_requested {
+                        let should_retry_suffix = last_suffix_request_at
+                            .map(|timestamp| {
+                                timestamp.elapsed()
+                                    >= time::Duration::from_millis(COMMITTER_RECOVERY_RETRY_BACKOFF_MS)
+                            })
+                            .unwrap_or(true);
+                        if should_retry_suffix {
                             self.tx_header_waiter
                                 .send(WaiterMessage::SyncCommittedProposal(
                                     proposal.clone(),
@@ -388,7 +408,7 @@ impl Synchronizer {
                                 ))
                                 .await
                                 .expect("Failed to send proposal suffix request");
-                            suffix_requested = true;
+                            last_suffix_request_at = Some(time::Instant::now());
                         }
                         time::sleep(time::Duration::from_millis(50)).await;
                     }
