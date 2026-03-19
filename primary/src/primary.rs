@@ -83,7 +83,7 @@ pub enum PrimaryWorkerMessage {
     /// The primary indicates that the worker need to sync the target missing batches.
     Synchronize(Vec<Digest>, /* target */ PublicKey),
     /// Commit-critical batch sync for the earliest blocked slot.
-    SynchronizeCommitted(Vec<Digest>, /* target */ PublicKey),
+    SynchronizeCommitted(Vec<Digest>, /* target */ PublicKey, /* blocked_height */ Height),
     /// The primary indicates a round update.
     Cleanup(Height),
 }

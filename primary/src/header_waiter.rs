@@ -540,7 +540,11 @@ impl HeaderWaiter {
                                         .expect("Our worker is not in the committee")
                                         .primary_to_worker;
                                     debug!("Sent syncbatches message for height {}", round);
-                                    let message = PrimaryWorkerMessage::SynchronizeCommitted(digests, author);
+                                    let message = PrimaryWorkerMessage::SynchronizeCommitted(
+                                        digests,
+                                        author,
+                                        round,
+                                    );
                                     let bytes = bincode::serialize(&message)
                                         .expect("Failed to serialize batch sync request");
                                     self.network.send(address, Bytes::from(bytes)).await;

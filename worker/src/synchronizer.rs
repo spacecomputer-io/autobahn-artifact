@@ -3,6 +3,8 @@ use crate::metrics::{
     WORKER_SYNC_COMPLETIONS_TOTAL, WORKER_SYNC_PENDING_BATCHES, WORKER_SYNC_PENDING_DEPENDENTS,
     WORKER_SYNC_RECOVERY_LATENCY_MS, WORKER_SYNC_REQUESTS_TOTAL, WORKER_SYNC_RETRIES_TOTAL,
     WORKER_SYNC_TARGET_ROTATIONS_TOTAL, WORKER_SYNC_GC_EVICTIONS_TOTAL,
+    WORKER_SYNC_OLDEST_BLOCKED_HEIGHT, WORKER_SYNC_RETRY_BUDGET_SKIPS_TOTAL,
+    WORKER_SYNC_STALLED_BATCHES, WORKER_SYNC_TARGET_COOLDOWNS_TOTAL,
 };
 use crate::worker::{Round, WorkerMessage};
 use bytes::Bytes;
@@ -27,6 +29,14 @@ pub mod synchronizer_tests;
 const TIMER_RESOLUTION: u64 = 1_000;
 /// Minimum initial fanout for commit-critical batch recovery.
 const INITIAL_COMMITTED_SYNC_FANOUT: usize = 3;
+/// Retry only a bounded number of commit-critical digests per timer tick, ordered oldest-first.
+const MAX_COMMIT_CRITICAL_RETRIES_PER_TICK: usize = 128;
+/// A pending batch is considered stalled after this long without local recovery.
+const STALLED_BATCH_THRESHOLD_MS: u128 = 5_000;
+/// Temporarily de-prioritize targets that have been retried this many times for the same digest.
+const TARGET_COOLDOWN_AFTER_ATTEMPTS: u32 = 3;
+/// How long to keep a target on cooldown after repeated unsuccessful attempts.
+const TARGET_COOLDOWN_MS: u128 = 5_000;
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 enum SyncPriority {
@@ -36,6 +46,7 @@ enum SyncPriority {
 
 struct PendingBatchSync {
     round: Round,
+    blocked_height: Round,
     cancel: Sender<()>,
     timestamp: u128,
     first_request_timestamp: u128,
@@ -43,6 +54,7 @@ struct PendingBatchSync {
     priority: SyncPriority,
     dependents: u64,
     attempted_targets: HashSet<PublicKey>,
+    target_attempts: HashMap<PublicKey, u32>,
 }
 
 // The `Synchronizer` is responsible to keep the worker in sync with the others.
@@ -72,6 +84,8 @@ pub struct Synchronizer {
     /// processing will resume when we get the missing batches in the store or we no longer need them.
     /// It also keeps the round number and a timestamp (`u128`) of each request we sent.
     pending: HashMap<Digest, PendingBatchSync>,
+    /// Targets that should be skipped temporarily during retry selection.
+    target_cooldowns: HashMap<PublicKey, u128>,
 }
 
 impl Synchronizer {
@@ -87,16 +101,38 @@ impl Synchronizer {
         let mut committed_batches = 0_i64;
         let mut background_dependents = 0_i64;
         let mut committed_dependents = 0_i64;
+        let mut background_stalled = 0_i64;
+        let mut committed_stalled = 0_i64;
+        let mut oldest_background_height = i64::MAX;
+        let mut oldest_committed_height = i64::MAX;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Failed to measure time")
+            .as_millis();
 
         for request in self.pending.values() {
             match request.priority {
                 SyncPriority::Background => {
                     background_batches += 1;
                     background_dependents += request.dependents as i64;
+                    oldest_background_height =
+                        oldest_background_height.min(request.blocked_height as i64);
+                    if now.saturating_sub(request.first_request_timestamp)
+                        >= STALLED_BATCH_THRESHOLD_MS
+                    {
+                        background_stalled += 1;
+                    }
                 }
                 SyncPriority::CommitCritical => {
                     committed_batches += 1;
                     committed_dependents += request.dependents as i64;
+                    oldest_committed_height =
+                        oldest_committed_height.min(request.blocked_height as i64);
+                    if now.saturating_sub(request.first_request_timestamp)
+                        >= STALLED_BATCH_THRESHOLD_MS
+                    {
+                        committed_stalled += 1;
+                    }
                 }
             }
         }
@@ -113,6 +149,26 @@ impl Synchronizer {
         WORKER_SYNC_PENDING_DEPENDENTS
             .with_label_values(&["commit_critical"])
             .set(committed_dependents);
+        WORKER_SYNC_STALLED_BATCHES
+            .with_label_values(&["background"])
+            .set(background_stalled);
+        WORKER_SYNC_STALLED_BATCHES
+            .with_label_values(&["commit_critical"])
+            .set(committed_stalled);
+        WORKER_SYNC_OLDEST_BLOCKED_HEIGHT
+            .with_label_values(&["background"])
+            .set(if oldest_background_height == i64::MAX {
+                0
+            } else {
+                oldest_background_height
+            });
+        WORKER_SYNC_OLDEST_BLOCKED_HEIGHT
+            .with_label_values(&["commit_critical"])
+            .set(if oldest_committed_height == i64::MAX {
+                0
+            } else {
+                oldest_committed_height
+            });
     }
 
     fn candidate_targets(&self) -> Vec<PublicKey> {
@@ -126,6 +182,8 @@ impl Synchronizer {
     fn select_retry_target_from_candidates(
         candidates: &[PublicKey],
         request: &mut PendingBatchSync,
+        target_cooldowns: &HashMap<PublicKey, u128>,
+        now: u128,
     ) -> PublicKey {
         if !candidates.is_empty() && request.attempted_targets.len() >= candidates.len() {
             request.attempted_targets.clear();
@@ -134,8 +192,17 @@ impl Synchronizer {
 
         if let Some(next) = candidates
             .iter()
-            .find(|candidate| {
-                **candidate != request.target && !request.attempted_targets.contains(*candidate)
+            .filter(|candidate| {
+                target_cooldowns
+                    .get(*candidate)
+                    .map(|until| *until <= now)
+                    .unwrap_or(true)
+            })
+            .min_by_key(|candidate| {
+                (
+                    request.target_attempts.get(*candidate).copied().unwrap_or(0),
+                    if **candidate == request.target { 1 } else { 0 },
+                )
             })
             .cloned()
         {
@@ -144,7 +211,12 @@ impl Synchronizer {
 
         candidates
             .iter()
-            .find(|candidate| **candidate != request.target)
+            .min_by_key(|candidate| {
+                (
+                    request.target_attempts.get(*candidate).copied().unwrap_or(0),
+                    if **candidate == request.target { 1 } else { 0 },
+                )
+            })
             .cloned()
             .unwrap_or_else(|| request.target.clone())
     }
@@ -173,6 +245,7 @@ impl Synchronizer {
                 network: SimpleSender::new(),
                 round: Round::default(),
                 pending: HashMap::new(),
+                target_cooldowns: HashMap::new(),
             }
             .run()
             .await;
@@ -301,11 +374,14 @@ impl Synchronizer {
                     .collect();
 
                 if !other_addresses.is_empty() {
+                    let fanout = other_addresses
+                        .len()
+                        .min(self.sync_retry_nodes.max(INITIAL_COMMITTED_SYNC_FANOUT));
                     self.network
                         .lucky_broadcast(
-                            other_addresses.clone(),
+                            other_addresses,
                             Bytes::from(serialized),
-                            other_addresses.len(),
+                            fanout,
                         )
                         .await;
                 }
@@ -342,6 +418,7 @@ impl Synchronizer {
                                     existing.priority = SyncPriority::CommitCritical;
                                     existing.target = target.clone();
                                     existing.timestamp = now;
+                                    existing.blocked_height = existing.blocked_height.min(self.round);
                                     missing.push(digest.clone());
                                 }
                                 continue;
@@ -367,6 +444,7 @@ impl Synchronizer {
                                 digest,
                                 PendingBatchSync {
                                     round: self.round,
+                                    blocked_height: self.round,
                                     cancel: tx_cancel,
                                     timestamp: now,
                                     first_request_timestamp: now,
@@ -374,6 +452,7 @@ impl Synchronizer {
                                     priority,
                                     dependents: 1,
                                     attempted_targets: HashSet::from([target.clone()]),
+                                    target_attempts: HashMap::from([(target.clone(), 1)]),
                                 },
                             );
                         }
@@ -381,7 +460,7 @@ impl Synchronizer {
                         self.send_sync_request(missing, target, priority, false).await;
                         self.update_sync_metrics();
                     }
-                    PrimaryWorkerMessage::SynchronizeCommitted(digests, target) => {
+                    PrimaryWorkerMessage::SynchronizeCommitted(digests, target, blocked_height) => {
                         let priority = SyncPriority::CommitCritical;
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -395,14 +474,13 @@ impl Synchronizer {
                             if let Some(existing) = self.pending.get_mut(&digest) {
                                 existing.dependents += 1;
                                 existing.attempted_targets.insert(target.clone());
-                                if priority == SyncPriority::CommitCritical
-                                    && existing.priority != SyncPriority::CommitCritical
-                                {
+                                if existing.priority != SyncPriority::CommitCritical {
                                     existing.priority = SyncPriority::CommitCritical;
                                     existing.target = target.clone();
                                     existing.timestamp = now;
                                     missing.push(digest.clone());
                                 }
+                                existing.blocked_height = existing.blocked_height.min(blocked_height);
                                 continue;
                             }
 
@@ -430,6 +508,7 @@ impl Synchronizer {
                                 digest,
                                 PendingBatchSync {
                                     round: self.round,
+                                    blocked_height,
                                     cancel: tx_cancel,
                                     timestamp: now,
                                     first_request_timestamp: now,
@@ -437,6 +516,7 @@ impl Synchronizer {
                                     priority,
                                     dependents: 1,
                                     attempted_targets: HashSet::from([target.clone()]),
+                                    target_attempts: HashMap::from([(target.clone(), 1)]),
                                 },
                             );
                         }
@@ -519,16 +599,55 @@ impl Synchronizer {
                         .duration_since(UNIX_EPOCH)
                         .expect("Failed to measure time")
                         .as_millis();
+                    self.target_cooldowns.retain(|_, until| *until > now);
                     let candidate_targets = self.candidate_targets();
 
                     let mut retry_groups: HashMap<(SyncPriority, PublicKey), Vec<Digest>> =
                         HashMap::new();
-                    for (digest, request) in &mut self.pending {
+                    let mut background_retry = Vec::new();
+                    let mut committed_retry = Vec::new();
+                    for (digest, request) in &self.pending {
                         if request.timestamp + (self.sync_retry_delay as u128) < now {
+                            match request.priority {
+                                SyncPriority::Background => background_retry.push(digest.clone()),
+                                SyncPriority::CommitCritical => committed_retry.push(digest.clone()),
+                            }
+                        }
+                    }
+                    committed_retry.sort_by_key(|digest| {
+                        self.pending
+                            .get(digest)
+                            .map(|request| request.blocked_height)
+                            .unwrap_or(Round::MAX)
+                    });
+                    if committed_retry.len() > MAX_COMMIT_CRITICAL_RETRIES_PER_TICK {
+                        WORKER_SYNC_RETRY_BUDGET_SKIPS_TOTAL
+                            .with_label_values(&["commit_critical"])
+                            .inc_by((committed_retry.len() - MAX_COMMIT_CRITICAL_RETRIES_PER_TICK) as u64);
+                        committed_retry.truncate(MAX_COMMIT_CRITICAL_RETRIES_PER_TICK);
+                    }
+
+                    let retry_digests = background_retry.into_iter().chain(committed_retry.into_iter());
+                    for digest in retry_digests {
+                        let mut cooldown_target = None;
+                        let (priority, next_target_for_group) = {
+                            let Some(request) = self.pending.get_mut(&digest) else {
+                                continue;
+                            };
                             debug!("Requesting sync for batch {} (retry)", digest);
                             request.timestamp = now;
-                            let next_target =
-                                Self::select_retry_target_from_candidates(&candidate_targets, request);
+                            let next_target = Self::select_retry_target_from_candidates(
+                                &candidate_targets,
+                                request,
+                                &self.target_cooldowns,
+                                now,
+                            );
+                            let attempts = request.target_attempts.entry(next_target.clone()).or_insert(0);
+                            *attempts += 1;
+                            if *attempts >= TARGET_COOLDOWN_AFTER_ATTEMPTS {
+                                cooldown_target = Some(next_target.clone());
+                                *attempts = 0;
+                            }
                             if next_target != request.target {
                                 WORKER_SYNC_TARGET_ROTATIONS_TOTAL
                                     .with_label_values(&[Self::priority_label(request.priority)])
@@ -539,11 +658,18 @@ impl Synchronizer {
                             WORKER_SYNC_RETRIES_TOTAL
                                 .with_label_values(&[Self::priority_label(request.priority)])
                                 .inc();
-                            retry_groups
-                                .entry((request.priority, next_target))
-                                .or_default()
-                                .push(digest.clone());
+                            (request.priority, next_target)
+                        };
+                        if let Some(target) = cooldown_target {
+                            self.target_cooldowns.insert(target, now + TARGET_COOLDOWN_MS);
+                            WORKER_SYNC_TARGET_COOLDOWNS_TOTAL
+                                .with_label_values(&[Self::priority_label(priority)])
+                                .inc();
                         }
+                        retry_groups
+                            .entry((priority, next_target_for_group))
+                            .or_default()
+                            .push(digest.clone());
                     }
 
                     for ((priority, target), digests) in retry_groups {

@@ -105,4 +105,36 @@ lazy_static! {
             &["priority"]
         )
         .expect("failed to register worker_sync_gc_evictions_total");
+
+    pub static ref WORKER_SYNC_TARGET_COOLDOWNS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "worker_sync_target_cooldowns_total",
+            "Total number of times a target was temporarily cooled down for worker batch sync retries",
+            &["priority"]
+        )
+        .expect("failed to register worker_sync_target_cooldowns_total");
+
+    pub static ref WORKER_SYNC_STALLED_BATCHES: IntGaugeVec =
+        register_int_gauge_vec!(
+            "worker_sync_stalled_batches",
+            "Current number of pending batch syncs older than the stalled threshold by priority",
+            &["priority"]
+        )
+        .expect("failed to register worker_sync_stalled_batches");
+
+    pub static ref WORKER_SYNC_OLDEST_BLOCKED_HEIGHT: IntGaugeVec =
+        register_int_gauge_vec!(
+            "worker_sync_oldest_blocked_height",
+            "Oldest blocked height among pending batch syncs by priority",
+            &["priority"]
+        )
+        .expect("failed to register worker_sync_oldest_blocked_height");
+
+    pub static ref WORKER_SYNC_RETRY_BUDGET_SKIPS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "worker_sync_retry_budget_skips_total",
+            "Total number of eligible worker batch sync retries skipped because of the per-tick retry budget",
+            &["priority"]
+        )
+        .expect("failed to register worker_sync_retry_budget_skips_total");
 }
