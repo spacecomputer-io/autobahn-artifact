@@ -43,7 +43,7 @@ impl SimpleSender {
 
     /// Helper function to spawn a new connection.
     fn spawn_connection(address: SocketAddr) -> Sender<Bytes> {
-        let (tx, rx) = channel(1_000);
+        let (tx, rx) = channel(5_000);
         Connection::spawn(address, rx);
         tx
     }
@@ -102,6 +102,40 @@ impl SimpleSender {
             }
         }
         dropped
+    }
+
+    /// Non-blocking best-effort send: enqueue the message to the peer's channel without
+    /// waiting. Returns true if enqueued, false if dropped (channel full or closed).
+    pub fn send_best_effort(&mut self, address: SocketAddr, data: Bytes) -> bool {
+        NETWORK_MESSAGES_TOTAL.with_label_values(&["send"]).inc();
+        if let Some(tx) = self.connections.get(&address) {
+            match tx.try_send(data.clone()) {
+                Ok(()) => return true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => return false,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Connection died — spawn a fresh one below
+                }
+            }
+        }
+        let tx = Self::spawn_connection(address);
+        let ok = tx.try_send(data).is_ok();
+        if ok {
+            self.connections.insert(address, tx);
+        }
+        ok
+    }
+
+    /// Non-blocking lucky_broadcast: pick `nodes` addresses at random and send best-effort.
+    /// Returns the number of sends that were dropped due to backpressure.
+    pub fn lucky_broadcast_best_effort(
+        &mut self,
+        mut addresses: Vec<SocketAddr>,
+        data: Bytes,
+        nodes: usize,
+    ) -> usize {
+        addresses.shuffle(&mut self.rng);
+        addresses.truncate(nodes);
+        self.broadcast_best_effort(addresses, data)
     }
 
     /// Pick a few addresses at random (specified by `nodes`) and try (best-effort) to send the

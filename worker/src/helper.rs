@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::metrics::WORKER_HELPER_REQUESTS_TOTAL;
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
@@ -61,8 +62,17 @@ impl Helper {
             // Reply to the request (the best we can).
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
-                    Ok(Some(data)) => self.network.send(address, Bytes::from(data)).await,
-                    Ok(None) => (),
+                    Ok(Some(data)) => {
+                        WORKER_HELPER_REQUESTS_TOTAL
+                            .with_label_values(&["served"])
+                            .inc();
+                        self.network.send(address, Bytes::from(data)).await;
+                    }
+                    Ok(None) => {
+                        WORKER_HELPER_REQUESTS_TOTAL
+                            .with_label_values(&["missing"])
+                            .inc();
+                    }
                     Err(e) => error!("{}", e),
                 }
             }

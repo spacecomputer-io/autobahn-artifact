@@ -1,7 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::metrics::{
-    WORKER_SYNC_COMPLETIONS_TOTAL, WORKER_SYNC_PENDING_BATCHES, WORKER_SYNC_PENDING_DEPENDENTS,
-    WORKER_SYNC_RECOVERY_LATENCY_MS, WORKER_SYNC_REQUESTS_TOTAL, WORKER_SYNC_RETRIES_TOTAL,
+    WORKER_SYNC_COMPLETIONS_TOTAL, WORKER_SYNC_HEARTBEAT_MS, WORKER_SYNC_PENDING_BATCHES,
+    WORKER_SYNC_PENDING_DEPENDENTS, WORKER_SYNC_RECOVERY_LATENCY_MS, WORKER_SYNC_REQUESTS_TOTAL,
+    WORKER_SYNC_RETRIES_TOTAL, WORKER_SYNC_RETRY_SENDS_DROPPED_TOTAL,
     WORKER_SYNC_TARGET_ROTATIONS_TOTAL, WORKER_SYNC_GC_EVICTIONS_TOTAL,
     WORKER_SYNC_OLDEST_BLOCKED_HEIGHT, WORKER_SYNC_RETRY_BUDGET_SKIPS_TOTAL,
     WORKER_SYNC_STALLED_BATCHES, WORKER_SYNC_TARGET_COOLDOWNS_TOTAL,
@@ -391,6 +392,74 @@ impl Synchronizer {
         }
     }
 
+    /// Non-blocking variant of send_sync_request for retry sends.
+    /// Uses try_send so the synchronizer event loop never blocks on a wedged
+    /// connection. Returns (target_enqueued, fanout_dropped):
+    /// - target_enqueued: whether the primary target send succeeded
+    /// - fanout_dropped: number of secondary fanout sends that were dropped
+    fn send_sync_request_nonblocking(
+        &mut self,
+        digests: Vec<Digest>,
+        target: PublicKey,
+        priority: SyncPriority,
+    ) -> (bool, usize) {
+        if digests.is_empty() {
+            return (true, 0);
+        }
+
+        WORKER_SYNC_REQUESTS_TOTAL
+            .with_label_values(&[Self::priority_label(priority), "retry"])
+            .inc_by(digests.len() as u64);
+
+        let message = WorkerMessage::BatchRequest(digests, self.name);
+        let serialized =
+            bincode::serialize(&message).expect("Failed to serialize our own message");
+
+        // Send to primary target (non-blocking).
+        let target_address = match self.committee.worker(&target, &self.id) {
+            Ok(address) => address.worker_to_worker,
+            Err(e) => {
+                error!("The primary asked us to sync with an unknown node: {}", e);
+                return (false, 0);
+            }
+        };
+        let target_enqueued = self
+            .network
+            .send_best_effort(target_address, Bytes::from(serialized.clone()));
+
+        // Fan-out to other workers (non-blocking).
+        let mut fanout_dropped = 0;
+        let other_addresses: Vec<_> = self
+            .committee
+            .others_workers(&self.name, &self.id)
+            .iter()
+            .filter(|(name, _)| *name != target)
+            .map(|(_, address)| address.worker_to_worker)
+            .collect();
+        if !other_addresses.is_empty() {
+            let fanout = match priority {
+                SyncPriority::CommitCritical => other_addresses
+                    .len()
+                    .min(self.sync_retry_nodes.max(INITIAL_COMMITTED_SYNC_FANOUT)),
+                SyncPriority::Background => other_addresses.len().min(self.sync_retry_nodes),
+            };
+            fanout_dropped = self.network.lucky_broadcast_best_effort(
+                other_addresses,
+                Bytes::from(serialized),
+                fanout,
+            );
+        }
+
+        (target_enqueued, fanout_dropped)
+    }
+
+    fn now_ms() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Failed to measure time")
+            .as_millis()
+    }
+
     /// Main loop listening to the primary's messages.
     async fn run(&mut self) {
         let mut waiting = FuturesUnordered::new();
@@ -401,7 +470,11 @@ impl Synchronizer {
         loop {
             tokio::select! {
                 // Handle primary's messages.
-                Some(message) = self.rx_message.recv() => match message {
+                Some(message) = self.rx_message.recv() => {
+                    WORKER_SYNC_HEARTBEAT_MS
+                        .with_label_values(&["rx_message"])
+                        .set(Self::now_ms() as i64);
+                    match message {
                     PrimaryWorkerMessage::Synchronize(digests, target) => {
                         let priority = SyncPriority::Background;
                         let now = SystemTime::now()
@@ -564,11 +637,14 @@ impl Synchronizer {
                         });
                         self.update_sync_metrics();
                     }
-                },
+                }},
 
                 // Stream out the futures of the `FuturesUnordered` that completed.
                 Some(result) = waiting.next() => match result {
                     Ok(Some(digest)) => {
+                        WORKER_SYNC_HEARTBEAT_MS
+                            .with_label_values(&["completion"])
+                            .set(Self::now_ms() as i64);
                         // We got the batch, remove it from the pending list.
                         if let Some(request) = self.pending.remove(&digest) {
                             WORKER_SYNC_COMPLETIONS_TOTAL
@@ -593,6 +669,9 @@ impl Synchronizer {
 
                 // Triggers on timer's expiration.
                 () = &mut timer => {
+                    WORKER_SYNC_HEARTBEAT_MS
+                        .with_label_values(&["tick"])
+                        .set(Self::now_ms() as i64);
                     // We optimistically sent sync requests to a single node. If this timer triggers,
                     // it means we were wrong to trust it. We are done waiting for a reply and we now
                     // broadcast the request to a bunch of other nodes (selected at random).
@@ -642,7 +721,10 @@ impl Synchronizer {
                                 continue;
                             };
                             debug!("Requesting sync for batch {} (retry)", digest);
-                            request.timestamp = now;
+                            // NOTE: timestamp is NOT advanced here. It is only
+                            // advanced after send_sync_request_nonblocking confirms
+                            // the message was enqueued, to avoid suppressing retries
+                            // when sends are dropped due to backpressure.
                             let next_target = Self::select_retry_target_from_candidates(
                                 &candidate_targets,
                                 request,
@@ -679,9 +761,32 @@ impl Synchronizer {
                             .push(digest.clone());
                     }
 
+                    let mut total_dropped = 0_usize;
                     for ((priority, target), digests) in retry_groups {
-                        self.send_sync_request(digests, target, priority, true).await;
+                        let (target_enqueued, fanout_dropped) = self
+                            .send_sync_request_nonblocking(digests.clone(), target, priority);
+                        if target_enqueued {
+                            // Primary target got the message — a meaningful retry
+                            // went out. Advance timestamps regardless of fanout drops.
+                            for digest in &digests {
+                                if let Some(request) = self.pending.get_mut(digest) {
+                                    request.timestamp = now;
+                                }
+                            }
+                        }
+                        // Only count drops where the primary target was not reached.
+                        if !target_enqueued {
+                            total_dropped += 1;
+                        }
+                        total_dropped += fanout_dropped;
                     }
+                    if total_dropped > 0 {
+                        WORKER_SYNC_RETRY_SENDS_DROPPED_TOTAL
+                            .inc_by(total_dropped as u64);
+                    }
+                    WORKER_SYNC_HEARTBEAT_MS
+                        .with_label_values(&["retry_dispatch"])
+                        .set(Self::now_ms() as i64);
 
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));

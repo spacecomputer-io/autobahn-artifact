@@ -137,4 +137,31 @@ lazy_static! {
             &["priority"]
         )
         .expect("failed to register worker_sync_retry_budget_skips_total");
+
+    /// Heartbeat gauge: epoch millis of the last event in each category.
+    /// If "tick" stops advancing, the synchronizer event loop is frozen.
+    pub static ref WORKER_SYNC_HEARTBEAT_MS: IntGaugeVec =
+        register_int_gauge_vec!(
+            "worker_sync_heartbeat_ms",
+            "Epoch millis of the last synchronizer event by category",
+            &["event"]
+        )
+        .expect("failed to register worker_sync_heartbeat_ms");
+
+    /// Number of retry sends dropped because the network channel was full.
+    pub static ref WORKER_SYNC_RETRY_SENDS_DROPPED_TOTAL: IntCounter =
+        register_int_counter!(
+            "worker_sync_retry_sends_dropped_total",
+            "Total number of retry batch sends dropped due to network backpressure"
+        )
+        .expect("failed to register worker_sync_retry_sends_dropped_total");
+
+    /// Helper batch request outcomes.
+    pub static ref WORKER_HELPER_REQUESTS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "worker_helper_requests_total",
+            "Total number of batch requests handled by the helper",
+            &["result"]
+        )
+        .expect("failed to register worker_helper_requests_total");
 }
