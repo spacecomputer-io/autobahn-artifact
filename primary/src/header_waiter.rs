@@ -7,7 +7,7 @@ use crate::messages::{ConsensusMessage, Header, Proposal, proposal_digest};
 use crate::metrics::{
     DISSEMINATION_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL, DISSEMINATION_HOLE_DEPENDENTS,
     DISSEMINATION_INFLIGHT_HOLES, DISSEMINATION_RECOVERED_HEADERS_TOTAL,
-    DISSEMINATION_SYNC_RETRIES_TOTAL,
+    DISSEMINATION_RETRY_BUDGET_SKIPS_TOTAL, DISSEMINATION_SYNC_RETRIES_TOTAL,
 };
 use crate::primary::{Height, Slot, PrimaryMessage, PrimaryWorkerMessage};
 use bytes::Bytes;
@@ -36,6 +36,10 @@ const TIMER_RESOLUTION: u64 = 1_000;
 /// Higher values get missing data faster at the cost of more network traffic.
 const INITIAL_SYNC_FANOUT: usize = 3;
 
+/// Maximum number of parent/header sync retries dispatched per timer tick.
+/// Prevents retry storms when thousands of holes accumulate during partition recovery.
+const MAX_SYNC_RETRIES_PER_TICK: usize = 64;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PayloadSyncMode {
     Live(bool),
@@ -50,7 +54,10 @@ enum SyncPriority {
 
 #[derive(Clone)]
 struct SyncRequestState {
+    /// Highest round among all dependents (used for GC: retain if round > gc_round).
     round: Height,
+    /// Lowest round among all dependents (used for retry ordering: oldest first).
+    min_round: Height,
     timestamp: u128,
     priority: SyncPriority,
 }
@@ -417,6 +424,7 @@ impl HeaderWaiter {
             if self.inflight_proposals.contains(&proposal.header_digest) {
                 if let Some(request) = self.parent_requests.get_mut(&proposal.header_digest) {
                     request.round = request.round.max(proposal.height);
+                    request.min_round = request.min_round.min(proposal.height);
                     request.priority = SyncPriority::CommitCritical;
                     request.timestamp = now;
                 }
@@ -428,6 +436,7 @@ impl HeaderWaiter {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let request = entry.get_mut();
                     request.round = request.round.max(proposal.height);
+                    request.min_round = request.min_round.min(proposal.height);
                     request.priority = SyncPriority::CommitCritical;
                     request.timestamp = now;
                 }
@@ -435,6 +444,7 @@ impl HeaderWaiter {
                     requires_sync.push(proposal.header_digest.clone());
                     entry.insert(SyncRequestState {
                         round: proposal.height,
+                        min_round: proposal.height,
                         timestamp: now,
                         priority: SyncPriority::CommitCritical,
                     });
@@ -522,7 +532,14 @@ impl HeaderWaiter {
                                         .batch_requests
                                         .entry(digest.clone())
                                         .or_insert((round, false));
-                                    if !entry.1 {
+                                    // Always re-send when Historical mode upgrades a
+                                    // previously live-only request so the worker receives
+                                    // SynchronizeCommitted and can promote to CommitCritical.
+                                    let needs_send = match mode {
+                                        PayloadSyncMode::Historical => true,
+                                        PayloadSyncMode::Live(_) => !entry.1,
+                                    };
+                                    if needs_send {
                                         requires_sync
                                             .entry(worker_id)
                                             .or_insert_with(Vec::new)
@@ -540,11 +557,18 @@ impl HeaderWaiter {
                                         .expect("Our worker is not in the committee")
                                         .primary_to_worker;
                                     debug!("Sent syncbatches message for height {}", round);
-                                    let message = PrimaryWorkerMessage::SynchronizeCommitted(
-                                        digests,
-                                        author,
-                                        round,
-                                    );
+                                    // Historical (commit-recovery) payloads get CommitCritical
+                                    // priority on the worker; live-path payloads stay Background.
+                                    let message = match mode {
+                                        PayloadSyncMode::Historical => {
+                                            PrimaryWorkerMessage::SynchronizeCommitted(
+                                                digests, author, round,
+                                            )
+                                        }
+                                        PayloadSyncMode::Live(_) => {
+                                            PrimaryWorkerMessage::Synchronize(digests, author)
+                                        }
+                                    };
                                     let bytes = bincode::serialize(&message)
                                         .expect("Failed to serialize batch sync request");
                                     self.network.send(address, Bytes::from(bytes)).await;
@@ -566,6 +590,7 @@ impl HeaderWaiter {
                                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                                     let request = entry.get_mut();
                                     request.round = request.round.max(round);
+                                    request.min_round = request.min_round.min(round);
                                     request.priority = SyncPriority::CommitCritical;
                                     request.timestamp = now;
                                     requires_sync.push(missing);
@@ -574,6 +599,7 @@ impl HeaderWaiter {
                                     requires_sync.push(missing);
                                     entry.insert(SyncRequestState {
                                         round,
+                                        min_round: round,
                                         timestamp: now,
                                         priority: SyncPriority::CommitCritical,
                                     });
@@ -647,10 +673,12 @@ impl HeaderWaiter {
                                 .entry(missing.clone())
                                 .or_insert_with(|| SyncRequestState {
                                     round: height,
+                                    min_round: height,
                                     timestamp: now,
                                     priority: SyncPriority::Background,
                                 });
                             request.round = request.round.max(height);
+                            request.min_round = request.min_round.min(height);
 
                             let dependents = self.parent_dependents.entry(missing.clone()).or_default();
                             if !dependents.iter().any(|dependent| dependent.id == header.id) {
@@ -752,30 +780,77 @@ impl HeaderWaiter {
                         .expect("Failed to measure time")
                         .as_millis();
 
-                    //Retry CertificateRequests
-                    let mut retry = Vec::new();
-                    for (digest, request) in self.parent_requests.iter_mut() {
+                    // Retry parent requests with a per-tick budget.
+                    // Commit-critical retries go first (sorted by round, oldest first),
+                    // then background retries fill any remaining budget.
+                    let mut parent_critical = Vec::new();
+                    let mut parent_background = Vec::new();
+                    for (digest, request) in self.parent_requests.iter() {
                         if request.timestamp + (self.sync_retry_delay as u128) < now {
-                            debug!("Requesting retry sync for parent header {} (retry)", digest);
-                            retry.push(digest.clone());
+                            match request.priority {
+                                SyncPriority::CommitCritical => parent_critical.push((digest.clone(), request.min_round)),
+                                SyncPriority::Background => parent_background.push((digest.clone(), request.min_round)),
+                            }
+                        }
+                    }
+                    // Sort oldest-first by min_round (lowest round = oldest hole).
+                    parent_critical.sort_by_key(|(_, min_round)| *min_round);
+                    parent_background.sort_by_key(|(_, min_round)| *min_round);
+                    // Shared budget: commit-critical first (priority), then background
+                    // fills remaining slots. Total capped to prevent retry storms.
+                    let mut parent_retry: Vec<Digest> = parent_critical.into_iter()
+                        .chain(parent_background.into_iter())
+                        .map(|(digest, _)| digest)
+                        .collect();
+                    if parent_retry.len() > MAX_SYNC_RETRIES_PER_TICK {
+                        DISSEMINATION_RETRY_BUDGET_SKIPS_TOTAL
+                            .with_label_values(&["parent"])
+                            .inc_by((parent_retry.len() - MAX_SYNC_RETRIES_PER_TICK) as u64);
+                        parent_retry.truncate(MAX_SYNC_RETRIES_PER_TICK);
+                    }
+                    for digest in &parent_retry {
+                        if let Some(request) = self.parent_requests.get_mut(digest) {
                             request.timestamp = now;
                         }
                     }
-                    if !retry.is_empty() {
+                    if !parent_retry.is_empty() {
                         DISSEMINATION_SYNC_RETRIES_TOTAL
                             .with_label_values(&["parent"])
-                            .inc_by(retry.len() as u64);
+                            .inc_by(parent_retry.len() as u64);
                         let addresses = self.committee.others_primaries(&self.name).iter().map(|(_, x)| x.primary_to_primary).collect();
-                        let message = PrimaryMessage::HeadersRequest(retry, self.name);
+                        let message = PrimaryMessage::HeadersRequest(parent_retry, self.name);
                         let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
                         self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
                     }
 
-                    let mut header_retry = Vec::new();
-                    for (digest, request) in self.header_requests.iter_mut() {
+                    // Retry header requests with the same budget pattern.
+                    let mut header_critical = Vec::new();
+                    let mut header_background = Vec::new();
+                    for (digest, request) in self.header_requests.iter() {
                         if request.timestamp + (self.sync_retry_delay as u128) < now {
-                            debug!("Requesting retry sync for header {} (retry)", digest);
-                            header_retry.push(digest.clone());
+                            match request.priority {
+                                SyncPriority::CommitCritical => header_critical.push((digest.clone(), request.min_round)),
+                                SyncPriority::Background => header_background.push((digest.clone(), request.min_round)),
+                            }
+                        }
+                    }
+                    // Sort oldest-first by min_round (lowest round = oldest hole).
+                    header_critical.sort_by_key(|(_, min_round)| *min_round);
+                    header_background.sort_by_key(|(_, min_round)| *min_round);
+                    // Shared budget: commit-critical first (priority), then background
+                    // fills remaining slots. Total capped to prevent retry storms.
+                    let mut header_retry: Vec<Digest> = header_critical.into_iter()
+                        .chain(header_background.into_iter())
+                        .map(|(digest, _)| digest)
+                        .collect();
+                    if header_retry.len() > MAX_SYNC_RETRIES_PER_TICK {
+                        DISSEMINATION_RETRY_BUDGET_SKIPS_TOTAL
+                            .with_label_values(&["header"])
+                            .inc_by((header_retry.len() - MAX_SYNC_RETRIES_PER_TICK) as u64);
+                        header_retry.truncate(MAX_SYNC_RETRIES_PER_TICK);
+                    }
+                    for digest in &header_retry {
+                        if let Some(request) = self.header_requests.get_mut(digest) {
                             request.timestamp = now;
                         }
                     }
@@ -808,27 +883,36 @@ impl HeaderWaiter {
                         DISSEMINATION_SYNC_RETRIES_TOTAL
                             .with_label_values(&["suffix"])
                             .inc_by(suffix_retry.len() as u64);
-                        let addresses: Vec<_> = self
-                            .committee
-                            .others_primaries(&self.name)
-                            .iter()
-                            .map(|(_, x)| x.primary_to_primary)
-                            .collect();
                         for request in suffix_retry {
                             let message = PrimaryMessage::ProposalHeadersRequest(
-                                request.proposal,
+                                request.proposal.clone(),
                                 request.stop_height,
                                 self.name,
                             );
                             let bytes = bincode::serialize(&message)
                                 .expect("Failed to serialize proposal suffix request");
-                            self.network
-                                .lucky_broadcast(
-                                    addresses.clone(),
-                                    Bytes::from(bytes),
-                                    self.sync_retry_nodes,
-                                )
-                                .await;
+                            // Target certifiers first (they definitely have the data),
+                            // fall back to all primaries if certifiers list is empty.
+                            let certifiers = self.certifier_addresses(&request.proposal);
+                            if certifiers.is_empty() {
+                                let addresses = self.other_primary_addresses();
+                                self.network
+                                    .lucky_broadcast(
+                                        addresses,
+                                        Bytes::from(bytes),
+                                        self.sync_retry_nodes,
+                                    )
+                                    .await;
+                            } else {
+                                let fanout = certifiers.len();
+                                self.network
+                                    .lucky_broadcast(
+                                        certifiers,
+                                        Bytes::from(bytes),
+                                        fanout,
+                                    )
+                                    .await;
+                            }
                         }
                     }
 

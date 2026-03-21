@@ -154,6 +154,13 @@ lazy_static! {
             "Total number of headers delivered back into core after sync recovery"
         ).expect("failed to register dissemination_recovered_headers_total");
 
+    pub static ref DISSEMINATION_RETRY_BUDGET_SKIPS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "dissemination_retry_budget_skips_total",
+            "Total number of eligible primary sync retries skipped because of the per-tick retry budget",
+            &["kind"]
+        ).expect("failed to register dissemination_retry_budget_skips_total");
+
     /// NEW: Time from header broadcast to f+1 certificate formation
     pub static ref DISSEMINATION_HEADER_TO_CERT_LATENCY: Histogram =
         register_histogram!(

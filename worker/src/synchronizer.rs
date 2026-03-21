@@ -115,8 +115,10 @@ impl Synchronizer {
                 SyncPriority::Background => {
                     background_batches += 1;
                     background_dependents += request.dependents as i64;
-                    oldest_background_height =
-                        oldest_background_height.min(request.blocked_height as i64);
+                    if request.blocked_height != Round::MAX {
+                        oldest_background_height =
+                            oldest_background_height.min(request.blocked_height as i64);
+                    }
                     if now.saturating_sub(request.first_request_timestamp)
                         >= STALLED_BATCH_THRESHOLD_MS
                     {
@@ -418,7 +420,6 @@ impl Synchronizer {
                                     existing.priority = SyncPriority::CommitCritical;
                                     existing.target = target.clone();
                                     existing.timestamp = now;
-                                    existing.blocked_height = existing.blocked_height.min(self.round);
                                     missing.push(digest.clone());
                                 }
                                 continue;
@@ -444,7 +445,7 @@ impl Synchronizer {
                                 digest,
                                 PendingBatchSync {
                                     round: self.round,
-                                    blocked_height: self.round,
+                                    blocked_height: Round::MAX,
                                     cancel: tx_cancel,
                                     timestamp: now,
                                     first_request_timestamp: now,
@@ -620,14 +621,20 @@ impl Synchronizer {
                             .map(|request| request.blocked_height)
                             .unwrap_or(Round::MAX)
                     });
-                    if committed_retry.len() > MAX_COMMIT_CRITICAL_RETRIES_PER_TICK {
+                    // Shared budget: commit-critical first (priority), then background
+                    // fills remaining slots. Total capped to prevent retry storms —
+                    // each retry sends network fan-out to other workers.
+                    let mut retry_list: Vec<Digest> = committed_retry.into_iter()
+                        .chain(background_retry.into_iter())
+                        .collect();
+                    if retry_list.len() > MAX_COMMIT_CRITICAL_RETRIES_PER_TICK {
                         WORKER_SYNC_RETRY_BUDGET_SKIPS_TOTAL
-                            .with_label_values(&["commit_critical"])
-                            .inc_by((committed_retry.len() - MAX_COMMIT_CRITICAL_RETRIES_PER_TICK) as u64);
-                        committed_retry.truncate(MAX_COMMIT_CRITICAL_RETRIES_PER_TICK);
+                            .with_label_values(&["total"])
+                            .inc_by((retry_list.len() - MAX_COMMIT_CRITICAL_RETRIES_PER_TICK) as u64);
+                        retry_list.truncate(MAX_COMMIT_CRITICAL_RETRIES_PER_TICK);
                     }
 
-                    let retry_digests = background_retry.into_iter().chain(committed_retry.into_iter());
+                    let retry_digests = retry_list.into_iter();
                     for digest in retry_digests {
                         let mut cooldown_target = None;
                         let (priority, next_target_for_group) = {
