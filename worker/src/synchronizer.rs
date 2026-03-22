@@ -1,8 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::metrics::{
-    WORKER_SYNC_COMPLETIONS_TOTAL, WORKER_SYNC_HEARTBEAT_MS, WORKER_SYNC_PENDING_BATCHES,
-    WORKER_SYNC_PENDING_DEPENDENTS, WORKER_SYNC_RECOVERY_LATENCY_MS, WORKER_SYNC_REQUESTS_TOTAL,
-    WORKER_SYNC_RETRIES_TOTAL, WORKER_SYNC_RETRY_SENDS_DROPPED_TOTAL,
+    WORKER_SYNC_COMPLETIONS_TOTAL, WORKER_SYNC_HEARTBEAT_MS, WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL,
+    WORKER_SYNC_PENDING_BATCHES, WORKER_SYNC_PENDING_DEPENDENTS, WORKER_SYNC_RECOVERY_LATENCY_MS,
+    WORKER_SYNC_REQUESTS_TOTAL, WORKER_SYNC_RETRIES_TOTAL, WORKER_SYNC_RETRY_SENDS_DROPPED_TOTAL,
     WORKER_SYNC_TARGET_ROTATIONS_TOTAL, WORKER_SYNC_GC_EVICTIONS_TOTAL,
     WORKER_SYNC_OLDEST_BLOCKED_HEIGHT, WORKER_SYNC_RETRY_BUDGET_SKIPS_TOTAL,
     WORKER_SYNC_STALLED_BATCHES, WORKER_SYNC_TARGET_COOLDOWNS_TOTAL,
@@ -271,144 +271,28 @@ impl Synchronizer {
         }
     }
 
-    async fn send_sync_request(
+    /// Non-blocking send for both initial and retry batch sync requests.
+    /// Uses try_send so the synchronizer event loop never blocks on a wedged
+    /// connection. Returns (target_enqueued, fanout_dropped):
+    /// - target_enqueued: whether the primary target send succeeded
+    /// - fanout_dropped: number of secondary fanout sends that were dropped
+    ///
+    /// For initial Background sends, only targets the designated peer.
+    /// For initial CommitCritical and all retries, also fans out to other workers.
+    fn send_sync_request(
         &mut self,
         digests: Vec<Digest>,
         target: PublicKey,
         priority: SyncPriority,
         retry: bool,
-    ) {
-        if digests.is_empty() {
-            return;
-        }
-
-        let phase = if retry { "retry" } else { "initial" };
-        WORKER_SYNC_REQUESTS_TOTAL
-            .with_label_values(&[Self::priority_label(priority), phase])
-            .inc_by(digests.len() as u64);
-
-        let message = WorkerMessage::BatchRequest(digests, self.name);
-        let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
-
-        match (priority, retry) {
-            (SyncPriority::Background, false) => {
-                let address = match self.committee.worker(&target, &self.id) {
-                    Ok(address) => address.worker_to_worker,
-                    Err(e) => {
-                        error!("The primary asked us to sync with an unknown node: {}", e);
-                        return;
-                    }
-                };
-                self.network.send(address, Bytes::from(serialized)).await;
-            }
-            (SyncPriority::Background, true) => {
-                let target_address = match self.committee.worker(&target, &self.id) {
-                    Ok(address) => address.worker_to_worker,
-                    Err(e) => {
-                        error!("The primary asked us to sync with an unknown node: {}", e);
-                        return;
-                    }
-                };
-                self.network
-                    .send(target_address, Bytes::from(serialized.clone()))
-                    .await;
-
-                let other_addresses: Vec<_> = self
-                    .committee
-                    .others_workers(&self.name, &self.id)
-                    .iter()
-                    .filter(|(name, _)| *name != target)
-                    .map(|(_, address)| address.worker_to_worker)
-                    .collect();
-                if !other_addresses.is_empty() {
-                    let fanout = other_addresses.len().min(self.sync_retry_nodes);
-                    self.network
-                        .lucky_broadcast(other_addresses, Bytes::from(serialized), fanout)
-                        .await;
-                }
-            }
-            (SyncPriority::CommitCritical, false) => {
-                let target_address = match self.committee.worker(&target, &self.id) {
-                    Ok(address) => address.worker_to_worker,
-                    Err(e) => {
-                        error!("The primary asked us to sync with an unknown node: {}", e);
-                        return;
-                    }
-                };
-                self.network
-                    .send(target_address, Bytes::from(serialized.clone()))
-                    .await;
-
-                let other_addresses: Vec<_> = self
-                    .committee
-                    .others_workers(&self.name, &self.id)
-                    .iter()
-                    .filter(|(name, _)| *name != target)
-                    .map(|(_, address)| address.worker_to_worker)
-                    .collect();
-
-                if !other_addresses.is_empty() {
-                    let fanout = other_addresses
-                        .len()
-                        .min(self.sync_retry_nodes.max(INITIAL_COMMITTED_SYNC_FANOUT));
-                    self.network
-                        .lucky_broadcast(other_addresses, Bytes::from(serialized), fanout)
-                        .await;
-                }
-            }
-            (SyncPriority::CommitCritical, true) => {
-                let target_address = match self.committee.worker(&target, &self.id) {
-                    Ok(address) => address.worker_to_worker,
-                    Err(e) => {
-                        error!("The primary asked us to sync with an unknown node: {}", e);
-                        return;
-                    }
-                };
-                self.network
-                    .send(target_address, Bytes::from(serialized.clone()))
-                    .await;
-
-                let other_addresses: Vec<_> = self
-                    .committee
-                    .others_workers(&self.name, &self.id)
-                    .iter()
-                    .filter(|(name, _)| *name != target)
-                    .map(|(_, address)| address.worker_to_worker)
-                    .collect();
-
-                if !other_addresses.is_empty() {
-                    let fanout = other_addresses
-                        .len()
-                        .min(self.sync_retry_nodes.max(INITIAL_COMMITTED_SYNC_FANOUT));
-                    self.network
-                        .lucky_broadcast(
-                            other_addresses,
-                            Bytes::from(serialized),
-                            fanout,
-                        )
-                        .await;
-                }
-            }
-        }
-    }
-
-    /// Non-blocking variant of send_sync_request for retry sends.
-    /// Uses try_send so the synchronizer event loop never blocks on a wedged
-    /// connection. Returns (target_enqueued, fanout_dropped):
-    /// - target_enqueued: whether the primary target send succeeded
-    /// - fanout_dropped: number of secondary fanout sends that were dropped
-    fn send_sync_request_nonblocking(
-        &mut self,
-        digests: Vec<Digest>,
-        target: PublicKey,
-        priority: SyncPriority,
     ) -> (bool, usize) {
         if digests.is_empty() {
             return (true, 0);
         }
 
+        let phase = if retry { "retry" } else { "initial" };
         WORKER_SYNC_REQUESTS_TOTAL
-            .with_label_values(&[Self::priority_label(priority), "retry"])
+            .with_label_values(&[Self::priority_label(priority), phase])
             .inc_by(digests.len() as u64);
 
         let message = WorkerMessage::BatchRequest(digests, self.name);
@@ -427,27 +311,31 @@ impl Synchronizer {
             .network
             .send_best_effort(target_address, Bytes::from(serialized.clone()));
 
-        // Fan-out to other workers (non-blocking).
+        // Fan-out to other workers for retries and commit-critical initial sends.
+        // Initial background sends target only the designated peer.
         let mut fanout_dropped = 0;
-        let other_addresses: Vec<_> = self
-            .committee
-            .others_workers(&self.name, &self.id)
-            .iter()
-            .filter(|(name, _)| *name != target)
-            .map(|(_, address)| address.worker_to_worker)
-            .collect();
-        if !other_addresses.is_empty() {
-            let fanout = match priority {
-                SyncPriority::CommitCritical => other_addresses
-                    .len()
-                    .min(self.sync_retry_nodes.max(INITIAL_COMMITTED_SYNC_FANOUT)),
-                SyncPriority::Background => other_addresses.len().min(self.sync_retry_nodes),
-            };
-            fanout_dropped = self.network.lucky_broadcast_best_effort(
-                other_addresses,
-                Bytes::from(serialized),
-                fanout,
-            );
+        let needs_fanout = retry || priority == SyncPriority::CommitCritical;
+        if needs_fanout {
+            let other_addresses: Vec<_> = self
+                .committee
+                .others_workers(&self.name, &self.id)
+                .iter()
+                .filter(|(name, _)| *name != target)
+                .map(|(_, address)| address.worker_to_worker)
+                .collect();
+            if !other_addresses.is_empty() {
+                let fanout = match priority {
+                    SyncPriority::CommitCritical => other_addresses
+                        .len()
+                        .min(self.sync_retry_nodes.max(INITIAL_COMMITTED_SYNC_FANOUT)),
+                    SyncPriority::Background => other_addresses.len().min(self.sync_retry_nodes),
+                };
+                fanout_dropped = self.network.lucky_broadcast_best_effort(
+                    other_addresses,
+                    Bytes::from(serialized),
+                    fanout,
+                );
+            }
         }
 
         (target_enqueued, fanout_dropped)
@@ -531,7 +419,26 @@ impl Synchronizer {
                             );
                         }
 
-                        self.send_sync_request(missing, target, priority, false).await;
+                        let (target_ok, fanout_drops) =
+                            self.send_sync_request(missing.clone(), target, priority, false);
+                        if !target_ok {
+                            // Target enqueue failed — make these digests immediately
+                            // eligible for retry on the next timer tick.
+                            for digest in &missing {
+                                if let Some(request) = self.pending.get_mut(digest) {
+                                    request.timestamp = 0;
+                                }
+                            }
+                            WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL
+                                .inc_by(missing.len() as u64);
+                        }
+                        if fanout_drops > 0 {
+                            WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL
+                                .inc_by(fanout_drops as u64);
+                        }
+                        WORKER_SYNC_HEARTBEAT_MS
+                            .with_label_values(&["initial_dispatch"])
+                            .set(Self::now_ms() as i64);
                         self.update_sync_metrics();
                     }
                     PrimaryWorkerMessage::SynchronizeCommitted(digests, target, blocked_height) => {
@@ -595,7 +502,24 @@ impl Synchronizer {
                             );
                         }
 
-                        self.send_sync_request(missing, target, priority, false).await;
+                        let (target_ok, fanout_drops) =
+                            self.send_sync_request(missing.clone(), target, priority, false);
+                        if !target_ok {
+                            for digest in &missing {
+                                if let Some(request) = self.pending.get_mut(digest) {
+                                    request.timestamp = 0;
+                                }
+                            }
+                            WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL
+                                .inc_by(missing.len() as u64);
+                        }
+                        if fanout_drops > 0 {
+                            WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL
+                                .inc_by(fanout_drops as u64);
+                        }
+                        WORKER_SYNC_HEARTBEAT_MS
+                            .with_label_values(&["initial_dispatch"])
+                            .set(Self::now_ms() as i64);
                         self.update_sync_metrics();
                     }
                     PrimaryWorkerMessage::Cleanup(round) => {
@@ -764,7 +688,7 @@ impl Synchronizer {
                     let mut total_dropped = 0_usize;
                     for ((priority, target), digests) in retry_groups {
                         let (target_enqueued, fanout_dropped) = self
-                            .send_sync_request_nonblocking(digests.clone(), target, priority);
+                            .send_sync_request(digests.clone(), target, priority, true);
                         if target_enqueued {
                             // Primary target got the message — a meaningful retry
                             // went out. Advance timestamps regardless of fanout drops.

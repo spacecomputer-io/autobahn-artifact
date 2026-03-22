@@ -156,6 +156,14 @@ lazy_static! {
         )
         .expect("failed to register worker_sync_retry_sends_dropped_total");
 
+    /// Number of initial sends dropped because the network channel was full.
+    pub static ref WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL: IntCounter =
+        register_int_counter!(
+            "worker_sync_initial_sends_dropped_total",
+            "Total number of initial batch sends dropped due to network backpressure"
+        )
+        .expect("failed to register worker_sync_initial_sends_dropped_total");
+
     /// Helper batch request outcomes.
     pub static ref WORKER_HELPER_REQUESTS_TOTAL: IntCounterVec =
         register_int_counter_vec!(
