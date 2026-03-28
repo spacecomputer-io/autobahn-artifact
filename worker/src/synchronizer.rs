@@ -1,6 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::metrics::{
     WORKER_SYNC_COMPLETIONS_TOTAL, WORKER_SYNC_HEARTBEAT_MS, WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL,
+    WORKER_SYNC_MESSAGE_DIGESTS_TOTAL, WORKER_SYNC_MESSAGES_RECEIVED_TOTAL,
     WORKER_SYNC_PENDING_BATCHES, WORKER_SYNC_PENDING_DEPENDENTS, WORKER_SYNC_RECOVERY_LATENCY_MS,
     WORKER_SYNC_REQUESTS_TOTAL, WORKER_SYNC_RETRIES_TOTAL, WORKER_SYNC_RETRY_SENDS_DROPPED_TOTAL,
     WORKER_SYNC_TARGET_ROTATIONS_TOTAL, WORKER_SYNC_GC_EVICTIONS_TOTAL,
@@ -370,6 +371,13 @@ impl Synchronizer {
                             .expect("Failed to measure time")
                             .as_millis();
 
+                        WORKER_SYNC_MESSAGES_RECEIVED_TOTAL
+                            .with_label_values(&["synchronize"])
+                            .inc();
+                        WORKER_SYNC_MESSAGE_DIGESTS_TOTAL
+                            .with_label_values(&["synchronize"])
+                            .inc_by(digests.len() as u64);
+
                         let mut missing = Vec::new();
                         for digest in digests {
                             if let Some(existing) = self.pending.get_mut(&digest) {
@@ -386,17 +394,11 @@ impl Synchronizer {
                                 continue;
                             }
 
-                            match self.store.read(digest.to_vec()).await {
-                                Ok(None) => {
-                                    missing.push(digest.clone());
-                                    debug!("Requesting sync for batch {}", digest);
-                                },
-                                Ok(Some(_)) => {}
-                                Err(e) => {
-                                    error!("{}", e);
-                                    continue;
-                                }
-                            }
+                            // Skip store.read() pre-check: the waiter's notify_read
+                            // resolves immediately if the batch is already present
+                            // (store/src/lib.rs:47). Avoiding the store channel here
+                            // keeps the event loop non-blocking under recovery load.
+                            missing.push(digest.clone());
 
                             let deliver = digest.clone();
                             let (tx_cancel, rx_cancel) = channel(1);
@@ -448,6 +450,13 @@ impl Synchronizer {
                             .expect("Failed to measure time")
                             .as_millis();
 
+                        WORKER_SYNC_MESSAGES_RECEIVED_TOTAL
+                            .with_label_values(&["synchronize_committed"])
+                            .inc();
+                        WORKER_SYNC_MESSAGE_DIGESTS_TOTAL
+                            .with_label_values(&["synchronize_committed"])
+                            .inc_by(digests.len() as u64);
+
                         let mut missing = Vec::new();
                         for digest in digests {
                             // Ensure we do not send twice the same sync request, but
@@ -465,20 +474,9 @@ impl Synchronizer {
                                 continue;
                             }
 
-                            // Check if we received the batch in the meantime.
-                            match self.store.read(digest.to_vec()).await {
-                                Ok(None) => {
-                                    missing.push(digest.clone());
-                                    debug!("Requesting sync for batch {}", digest);
-                                },
-                                Ok(Some(_)) => {
-                                    // The batch arrived in the meantime: no need to request it.
-                                },
-                                Err(e) => {
-                                    error!("{}", e);
-                                    continue;
-                                }
-                            }
+                            // Skip store.read() pre-check: the waiter's notify_read
+                            // resolves immediately if the batch is already present.
+                            missing.push(digest.clone());
 
                             // Add the digest to the waiter.
                             let deliver = digest.clone();

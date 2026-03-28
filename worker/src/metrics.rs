@@ -164,6 +164,24 @@ lazy_static! {
         )
         .expect("failed to register worker_sync_initial_sends_dropped_total");
 
+    /// Number of batch digests received per sync message.
+    pub static ref WORKER_SYNC_MESSAGE_DIGESTS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "worker_sync_message_digests_total",
+            "Total number of batch digests received in sync messages",
+            &["kind"]
+        )
+        .expect("failed to register worker_sync_message_digests_total");
+
+    /// Number of sync messages received.
+    pub static ref WORKER_SYNC_MESSAGES_RECEIVED_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "worker_sync_messages_received_total",
+            "Total number of sync messages received from the primary",
+            &["kind"]
+        )
+        .expect("failed to register worker_sync_messages_received_total");
+
     /// Helper batch request outcomes.
     pub static ref WORKER_HELPER_REQUESTS_TOTAL: IntCounterVec =
         register_int_counter_vec!(
