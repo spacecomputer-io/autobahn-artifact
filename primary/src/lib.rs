@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 // Copyright(C) Facebook, Inc. and its affiliates.
 #[macro_use]
 pub mod error;
@@ -16,6 +17,7 @@ mod proposer;
 mod synchronizer;
 pub mod timer;
 pub mod metrics;
+pub mod telemetry;
 
 #[cfg(test)]
 #[path = "tests/common.rs"]
