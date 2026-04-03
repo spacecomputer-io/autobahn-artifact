@@ -3,7 +3,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
-use crate::metrics::WORKER_SYNC_CHANNEL_BACKPRESSURE_TOTAL;
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
 use crate::quorum_waiter::QuorumWaiter;
@@ -21,7 +20,6 @@ use std::error::Error;
 use std::process::Command;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
-use crate::metrics::WORKER_TRANSACTIONS_RECEIVED_TOTAL;
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -295,8 +293,6 @@ impl MessageHandler for TxReceiverHandler {
             .send(message.to_vec())
             .await
             .expect("Failed to send transaction");
-        WORKER_TRANSACTIONS_RECEIVED_TOTAL.inc();
-
         // Give the change to schedule other tasks.
         tokio::task::yield_now().await;
         Ok(())
@@ -361,7 +357,6 @@ impl MessageHandler for PrimaryReceiverHandler {
             Ok(message) => match self.tx_synchronizer.try_send(message) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
-                    WORKER_SYNC_CHANNEL_BACKPRESSURE_TOTAL.inc();
                     self.tx_synchronizer
                         .send(message)
                         .await

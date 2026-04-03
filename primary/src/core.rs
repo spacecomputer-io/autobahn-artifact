@@ -2,6 +2,14 @@
 #![allow(unused_variables)]
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::aggregators::{QCMaker, TCMaker, VotesAggregator};
+use crate::metrics::{
+    CONSENSUS_CURRENT_SLOT, CONSENSUS_CURRENT_VIEW,
+    CONSENSUS_FAST_PATH_COMMITS_TOTAL, CONSENSUS_SLOW_PATH_COMMITS_TOTAL,
+    CONSENSUS_SLOTS_COMMITTED_TOTAL, CONSENSUS_VIEW_CHANGES_TOTAL,
+    DISSEMINATION_HEADERS_POA_TOTAL,
+    DISSEMINATION_MISSING_PARENT_TOTAL, DISSEMINATION_MISSING_PAYLOAD_TOTAL,
+    now_ms, observe_header_poa, record_slot_committed,
+};
 //use crate::common::special_header;
 use crate::error::{DagError, DagResult};
 use crate::leader::LeaderElector;
@@ -19,18 +27,6 @@ use crypto::{Hash as _, Signature};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use log::{debug, error, warn, info};
-use crate::metrics::{
-    CONSENSUS_TIMEOUTS_TOTAL, CONSENSUS_TIMEOUTS_AS_LEADER_TOTAL,
-    CONSENSUS_VOTES_SENT_TOTAL, CONSENSUS_VOTES_RECEIVED_TOTAL, CONSENSUS_VOTES_REFUSED_TOTAL,
-    CONSENSUS_VIEW_CHANGES_TOTAL, CONSENSUS_LEADER_CHANGES_TOTAL,
-    DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL,
-    DISSEMINATION_HEADERS_BROADCAST_TOTAL, DISSEMINATION_HEADERS_VOTED_ON_TOTAL,
-    CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL, CONSENSUS_PREPARE_VOTES_SENT_TOTAL,
-    CONSENSUS_CONFIRM_VOTES_SENT_TOTAL, DISSEMINATION_CERT_SYNC_REQUESTS_SENT_TOTAL,
-    CONSENSUS_FAST_PATH_COMMITS_TOTAL, CONSENSUS_SLOW_PATH_COMMITS_TOTAL,
-    CONSENSUS_CURRENT_VIEW,
-    record_observer_prepare_receive,
-};
 use network::{CancelHandler, ReliableSender};
 use core::panic;
 use std::borrow::BorrowMut;
@@ -319,9 +315,6 @@ impl Core {
             .or_insert_with(Vec::new)
             .extend(handlers);
         
-        // Metric: header broadcast to other primaries
-        DISSEMINATION_HEADERS_BROADCAST_TOTAL.inc();
-
         // Process the header.
         self.process_header(header, false).await
     }
@@ -358,9 +351,8 @@ impl Core {
         // Ensure we have the payload. If we don't, the synchronizer will ask our workers to get it, and then
         // reschedule processing of this header once we have it.
         if self.synchronizer.missing_payload(&header, sync).await? {
-            //println!("Missing payload");
+            DISSEMINATION_MISSING_PAYLOAD_TOTAL.inc();
             debug!("Processing of {} suspended: missing payload", header);
-            CONSENSUS_VOTES_REFUSED_TOTAL.with_label_values(&["missing_payload"]).inc();
             return Ok(());
         }
 
@@ -371,9 +363,8 @@ impl Core {
             .await?
             .is_none()
         {
-            //println!("The parent is missing");
+            DISSEMINATION_MISSING_PARENT_TOTAL.inc();
             debug!("The parent is missing, suspending processing");
-            CONSENSUS_VOTES_REFUSED_TOTAL.with_label_values(&["missing_parent"]).inc();
             return Ok(());
         }
 
@@ -389,7 +380,6 @@ impl Core {
             // TODO: Use reputation
             //println!("Need to sync on missing tips, reschedule");
             debug!("Can't vote for prepare, need to sync on missing tips, suspending processing");
-            CONSENSUS_VOTES_REFUSED_TOTAL.with_label_values(&["wrong_view"]).inc();
             return Ok(());
         }
 
@@ -462,11 +452,6 @@ impl Core {
             .or_insert_with(HashSet::new)
             .insert(header.author)
         {
-            // Metric: voted on a header from another primary
-            if header.author != self.name {
-                DISSEMINATION_HEADERS_VOTED_ON_TOTAL.inc();
-            }
-            
             //println!("voting for header");
             // Process the consensus instances contained in the header (if any)
             let consensus_votes = self
@@ -486,27 +471,6 @@ impl Core {
             .await;
             //println!("Created vote");
             debug!("Created Vote {:?}", vote);
-
-            // Track vote sent - determine type based on consensus votes
-            let vote_type = if !consensus_votes.is_empty() {
-                // Look at first consensus vote to determine type
-                if let Some((slot, digest, _)) = consensus_votes.first() {
-                    if let Some(instance) = self.consensus_instances.get(&(*slot, digest.clone())) {
-                        match instance {
-                            ConsensusMessage::Prepare { .. } => "prepare",
-                            ConsensusMessage::Confirm { .. } => "confirm",
-                            _ => "consensus",
-                        }
-                    } else {
-                        "consensus"
-                    }
-                } else {
-                    "consensus"
-                }
-            } else {
-                "header" // Pure header vote with no consensus votes
-            };
-            CONSENSUS_VOTES_SENT_TOTAL.with_label_values(&[vote_type]).inc();
 
             if vote.origin == self.name {
                 self.process_vote(vote, false)
@@ -588,29 +552,6 @@ impl Core {
     #[async_recursion]
     async fn process_vote(&mut self, vote: Vote, is_loopback: bool) -> DagResult<()> {
         debug!("Processing Vote {:?}", vote);
-
-        // Track vote received (only if not loopback and not from self)
-        if !is_loopback && vote.author != self.name {
-            let vote_type = if !vote.consensus_votes.is_empty() {
-                // Determine type from first consensus vote
-                if let Some((slot, digest, _)) = vote.consensus_votes.first() {
-                    if let Some(instance) = self.consensus_instances.get(&(*slot, digest.clone())) {
-                        match instance {
-                            ConsensusMessage::Prepare { .. } => "prepare",
-                            ConsensusMessage::Confirm { .. } => "confirm",
-                            _ => "consensus",
-                        }
-                    } else {
-                        "consensus"
-                    }
-                } else {
-                    "consensus"
-                }
-            } else {
-                "header"
-            };
-            CONSENSUS_VOTES_RECEIVED_TOTAL.with_label_values(&[vote_type]).inc();
-        }
 
         // NOTE: If sending externally then need map of open consensus instances
 
@@ -838,7 +779,10 @@ impl Core {
                 .expect("Failed to send certificate");
 
             self.sent_cert_to_proposer = true;
-            //println!("after sending to proposer");
+            DISSEMINATION_HEADERS_POA_TOTAL.inc();
+            // Observe latency from header creation to PoA.
+            let poa_ts = now_ms();
+            observe_header_poa(&self.current_header.id, poa_ts);
             self.current_qcs_formed = 0;
         }
 
@@ -1044,13 +988,6 @@ impl Core {
 
         debug!("Send req for Consensus message {}", consensus_message);
 
-        // Metric: Track when this node sends a Prepare message (as leader)
-        if let ConsensusMessage::Prepare { slot, .. } = &consensus_message {
-            CONSENSUS_PREPARE_MESSAGES_SENT_TOTAL.inc();
-            // NOTE: We DON'T record leader latency here because the leader immediately
-            // processes its own Prepare locally (line 1061), which bypasses network delay.
-            // Leader latency will be recorded when we start collecting votes instead.
-        }
 
         let consensus_req = ConsensusRequest::new(self.name, consensus_message, &mut self.signature_service).await;
 
@@ -1211,11 +1148,8 @@ impl Core {
                     self.already_proposed_slots.insert(slot + 1);
                     //self.prepare_tickets.pop_front();
 
-                    // Start measuring slot propose-to-execute latency
                     #[cfg(feature = "benchmark")]
                     {
-                        use crate::metrics::record_slot_propose_time;
-                        record_slot_propose_time(slot + 1);
                         info!("Started slot {}", slot + 1);
                     }
 
@@ -1300,6 +1234,7 @@ impl Core {
                 let curr_view = self.views.get(slot).unwrap_or(&0);
                 if curr_view < view {
                     self.views.insert(*slot, *view);
+                    CONSENSUS_CURRENT_VIEW.set(*self.views.values().max().unwrap_or(&0) as i64);
                 }
 
                 // Ensure that we haven't already voted in this slot, view, that the ticket is
@@ -1313,6 +1248,7 @@ impl Core {
                 if curr_view <= view {
                     if verify_confirm(consensus_message, &self.committee){
                         self.views.insert(*slot, *view);
+                        CONSENSUS_CURRENT_VIEW.set(*self.views.values().max().unwrap_or(&0) as i64);
                         return true;
                     }
                     
@@ -1477,11 +1413,6 @@ impl Core {
             ConsensusMessage::Prepare { slot, view: _, tc: _, qc_ticket: _, proposals,} 
             => {
                 debug!("processing prepare in slot {:?} with proposal {:?}", slot, proposals);
-                
-                // Record timestamp for observer latency (only when receiving from another node)
-                if author != self.name {
-                    record_observer_prepare_receive(*slot);
-                }
                 
                 // Non-blocking sync (certified tips only): verify proposal certificates
                 // (PoA) instead of requiring local data availability. Per the Autobahn
@@ -1667,8 +1598,6 @@ impl Core {
                     .request_signature(prepare_message.digest())
                     .await;
                 consensus_sigs.push((*slot, prepare_message.digest(), sig));
-                // Metric: Prepare vote sent
-                CONSENSUS_PREPARE_VOTES_SENT_TOTAL.inc();
                 debug!("Prepare-Vote for slot: {}, view: {},has digest: {}", slot, view, prepare_message.digest());
             }
             _ => {}
@@ -1699,8 +1628,6 @@ impl Core {
                     .request_signature(confirm_message.digest())
                     .await;
                 consensus_sigs.push((*slot, confirm_message.digest(), sig));
-                // Metric: Confirm vote sent
-                CONSENSUS_CONFIRM_VOTES_SENT_TOTAL.inc();
                 debug!("Confirm-Vote for slot: {}, view: {}, qc_dig {:?} -> has digest: {}", slot, view, qc.id , confirm_message.digest());
             }
             _ => {}
@@ -1753,7 +1680,10 @@ impl Core {
                 let sl = *slot;
                 //update bounding heuristic
                 self.last_committed_slot = max(sl, self.last_committed_slot);
+                CONSENSUS_CURRENT_SLOT.set(self.last_committed_slot as i64);
                 self.committed_slots.insert(sl, CommitQC::new(*slot, *view, qc.clone(), proposals.clone()).await);
+                CONSENSUS_SLOTS_COMMITTED_TOTAL.inc();
+                record_slot_committed(sl, now_ms());
 
 
                 //self.begin_slot_from_commit(&commit_message).await.expect("Failed to start next consensus");
@@ -1969,9 +1899,6 @@ impl Core {
     async fn local_timeout_round(&mut self, slot: Slot, view: View) -> DagResult<()> {
         // Using warn! only for actionable timeouts; otherwise we mark as OBSOLETE and keep at debug level.
         warn!("Timeout fired for slot {}, view {} (pending evaluation)", slot, view);
-        CONSENSUS_TIMEOUTS_TOTAL.inc();
-        let leader = self.leader_elector.get_leader(slot, view);
-        if leader == self.name { CONSENSUS_TIMEOUTS_AS_LEADER_TOTAL.inc(); }
         //println!("timeout was triggered");
 
         //If timer was cancelled, ignore  -- Note: technically redundant with commit check below, but currently we do not insert CommitQC's... TODO: Need to insert these so we can avoid joining view change and just reply.
@@ -2084,21 +2011,10 @@ impl Core {
         if let Some(tc) = tc_maker.append(timeout.clone(), &self.committee)? {
             debug!("Assembled TimeoutCertificate {:?}", tc);
 
-            // Track view change (successful timeout with TC formed)
-            CONSENSUS_VIEW_CHANGES_TOTAL.inc();
-
-            // Check if leader changed
-            let old_leader = self.leader_elector.get_leader(timeout.slot, timeout.view);
-            let new_leader = self.leader_elector.get_leader(timeout.slot, timeout.view + 1);
-            if old_leader != new_leader {
-                CONSENSUS_LEADER_CHANGES_TOTAL.inc();
-            }
-
             // Try to advance the view
             self.views.insert(timeout.slot, timeout.view + 1);
-
-            // Update view gauge
-            CONSENSUS_CURRENT_VIEW.set((timeout.view + 1) as i64);
+            CONSENSUS_CURRENT_VIEW.set(*self.views.values().max().unwrap_or(&0) as i64);
+            CONSENSUS_VIEW_CHANGES_TOTAL.inc();
 
             // Start the new view timer
             let timer = Timer::new(tc.slot, tc.view + 1, self.timeout_delay);
@@ -2323,6 +2239,7 @@ impl Core {
         self.timer_futures.push(Box::pin(first_timer));
         self.timers.insert((1, 1));
         self.views.insert(1, 1);
+        CONSENSUS_CURRENT_VIEW.set(1);
 
         // If we are the first leader then create a prepare ticket for slot 1
         if self.name == self.leader_elector.get_leader(1, 1) {

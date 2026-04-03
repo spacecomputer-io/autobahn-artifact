@@ -11,8 +11,6 @@ use crypto::SignatureService;
 use env_logger::Env;
 use primary::Header;
 use primary::Primary;
-use primary::metrics::flush_interval_metrics;
-use primary::telemetry;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use worker::Worker;
@@ -138,24 +136,11 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // Channel for indicating commit and that new header should be proposed
     //let (tx_ticket, rx_ticket) = channel(CHANNEL_CAPACITY);
 
-    // Derive a short node identifier from the store path for telemetry files.
-    // e.g., ".db-0" → "0", ".db-0-1" → "0-1"
-    let node_id = store_path
-        .strip_prefix(".db-")
-        .unwrap_or(store_path)
-        .to_string();
-
     // Check whether to run a primary, a worker, or an entire authority.
     //Note: Each node has at most one worker. Workers that don't include a primary (e.g. are not an entire authority) use PrimaryConnector to connect to a designated primary.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", _) => {
-            // Initialize telemetry: event logger + fast state writer.
-            let events_path = format!("{}.events.csv", store_path);
-            let fast_state_path = format!("{}.fast_state.csv", store_path);
-            telemetry::init_event_logger(&events_path, "primary", &node_id);
-            telemetry::spawn_primary_fast_state(&fast_state_path, &node_id, 500);
-            telemetry::spawn_primary_event_sampler(500);
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
             let (tx_committer, rx_committer) = channel(CHANNEL_CAPACITY);
@@ -204,12 +189,6 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .parse::<WorkerId>()
                 .context("The worker id must be a positive integer")?;
 
-            // Initialize telemetry: event logger + fast state writer.
-            let events_path = format!("{}.events.csv", store_path);
-            let fast_state_path = format!("{}.fast_state.csv", store_path);
-            telemetry::init_event_logger(&events_path, "worker", &node_id);
-            spawn_worker_fast_state(&fast_state_path, &node_id, 500);
-
             Worker::spawn(keypair.name, id, committee, parameters, store);
         }
         _ => unreachable!(),
@@ -220,82 +199,6 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     // If this expression is reached, the program ends and all other tasks terminate.
     unreachable!();
-}
-
-/// Spawn a tokio task that samples critical worker gauges at `interval_ms`
-/// and writes them to a local CSV file.
-fn spawn_worker_fast_state(path: &str, node: &str, interval_ms: u64) {
-    use std::fs::OpenOptions;
-    use std::io::{BufWriter, Write};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use worker::metrics::{WORKER_SYNC_PENDING_BATCHES, WORKER_SYNC_STALLED_BATCHES};
-
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .unwrap_or_else(|e| panic!("Failed to open fast_state CSV at {}: {}", path, e));
-    let mut writer = BufWriter::new(file);
-    writeln!(
-        writer,
-        "ts_ms,role,node,worker_sync_pending_bg,worker_sync_pending_cc,worker_sync_stalled_bg,worker_sync_stalled_cc"
-    )
-    .expect("Failed to write fast_state CSV header");
-    writer.flush().expect("Failed to flush fast_state CSV header");
-
-    let node = node.to_string();
-    let interval = Duration::from_millis(interval_ms);
-
-    tokio::spawn(async move {
-        let mut prev_pending_total = 0i64;
-        let mut prev_stalled_total = 0i64;
-        let mut next = tokio::time::Instant::now() + interval;
-        loop {
-            tokio::time::sleep(next.saturating_duration_since(tokio::time::Instant::now())).await;
-            next += interval;
-
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Failed to measure time")
-                .as_millis();
-            let pending_bg = WORKER_SYNC_PENDING_BATCHES
-                .with_label_values(&["background"])
-                .get();
-            let pending_cc = WORKER_SYNC_PENDING_BATCHES
-                .with_label_values(&["commit_critical"])
-                .get();
-            let stalled_bg = WORKER_SYNC_STALLED_BATCHES
-                .with_label_values(&["background"])
-                .get();
-            let stalled_cc = WORKER_SYNC_STALLED_BATCHES
-                .with_label_values(&["commit_critical"])
-                .get();
-            let pending_total = pending_bg + pending_cc;
-            let stalled_total = stalled_bg + stalled_cc;
-
-            if prev_pending_total == 0 && pending_total > 0 {
-                telemetry::emit_event("worker_backlog_enter", &pending_total.to_string());
-            } else if prev_pending_total > 0 && pending_total == 0 {
-                telemetry::emit_event("worker_backlog_exit", "0");
-            }
-            prev_pending_total = pending_total;
-
-            if prev_stalled_total == 0 && stalled_total > 0 {
-                telemetry::emit_event("worker_stall_enter", &stalled_total.to_string());
-            } else if prev_stalled_total > 0 && stalled_total == 0 {
-                telemetry::emit_event("worker_stall_exit", "0");
-            }
-            prev_stalled_total = stalled_total;
-
-            let _ = writeln!(
-                writer,
-                "{},worker,{},{},{},{},{}",
-                ts, node, pending_bg, pending_cc, stalled_bg, stalled_cc
-            );
-            let _ = writer.flush();
-        }
-    });
 }
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
@@ -364,9 +267,6 @@ async fn start_metrics_file_flusher(
     tokio::spawn(async move {
         let encoder = TextEncoder::new();
         loop {
-            // Calculate averages and reset flush interval metrics before gathering
-            flush_interval_metrics(flush_interval_ms);
-            
             let metric_families = registry.gather();
             let mut buffer = Vec::new();
             if encoder.encode(&metric_families, &mut buffer).is_ok() {

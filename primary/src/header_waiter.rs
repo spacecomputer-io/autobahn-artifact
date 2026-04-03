@@ -5,9 +5,8 @@
 use crate::error::{DagError, DagResult};
 use crate::messages::{ConsensusMessage, Header, Proposal, proposal_digest};
 use crate::metrics::{
-    DISSEMINATION_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL, DISSEMINATION_HOLE_DEPENDENTS,
     DISSEMINATION_INFLIGHT_HOLES, DISSEMINATION_RECOVERED_HEADERS_TOTAL,
-    DISSEMINATION_RETRY_BUDGET_SKIPS_TOTAL, DISSEMINATION_SYNC_RETRIES_TOTAL,
+    DISSEMINATION_SYNC_REQUESTS_TOTAL,
 };
 use crate::primary::{Height, Slot, PrimaryMessage, PrimaryWorkerMessage};
 use bytes::Bytes;
@@ -285,26 +284,7 @@ impl HeaderWaiter {
     }
 
     fn update_recovery_metrics(&self) {
-        let mut inflight_holes = HashSet::new();
-        inflight_holes.extend(self.parent_requests.keys().cloned());
-        inflight_holes.extend(self.header_requests.keys().cloned());
-        inflight_holes.extend(self.batch_requests.keys().cloned());
-        inflight_holes.extend(self.proposal_sync_requests.keys().cloned());
-
-        DISSEMINATION_INFLIGHT_HOLES.set(inflight_holes.len() as i64);
-        DISSEMINATION_HOLE_DEPENDENTS
-            .set(
-                (
-                    self.pending.len()
-                        + self.pending_proposal_syncs.len()
-                        + self.pending_commit_syncs.len()
-                        + self
-                            .parent_dependents
-                            .values()
-                            .map(Vec::len)
-                            .sum::<usize>()
-                ) as i64,
-            );
+        DISSEMINATION_INFLIGHT_HOLES.set(self.pending.len() as i64);
     }
 
     fn certifier_addresses(&self, proposal: &Proposal) -> Vec<std::net::SocketAddr> {
@@ -365,6 +345,7 @@ impl HeaderWaiter {
                     .lucky_broadcast(certifiers, Bytes::from(bytes), fanout)
                     .await;
             }
+            DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["header"]).inc();
         }
     }
 
@@ -464,6 +445,7 @@ impl HeaderWaiter {
             let message = PrimaryMessage::HeadersRequest(requires_sync, self.name);
             let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
             self.network.lucky_broadcast(addresses, Bytes::from(bytes), INITIAL_SYNC_FANOUT).await;
+            DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["header"]).inc();
         }
     }
 
@@ -481,9 +463,6 @@ impl HeaderWaiter {
                 Some(message) = self.rx_synchronizer.recv() => {
                     match message {
                         WaiterMessage::SyncBatches(missing, header, mode) => {
-                            // Track sync request received
-                            DISSEMINATION_HEADER_SYNC_REQUESTS_RECEIVED_TOTAL.inc();
-
                             debug!("Synching the payload of {}", header);
                             let header_id = header.id.clone();
                             let round = header.height;
@@ -572,6 +551,7 @@ impl HeaderWaiter {
                                     let bytes = bincode::serialize(&message)
                                         .expect("Failed to serialize batch sync request");
                                     self.network.send(address, Bytes::from(bytes)).await;
+                                    DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["payload"]).inc();
                                 }
                             }
                         }
@@ -617,6 +597,7 @@ impl HeaderWaiter {
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
                                 // [E2] Use wider fan-out for initial header sync
                                 self.network.lucky_broadcast(addresses, Bytes::from(bytes), INITIAL_SYNC_FANOUT).await;
+                                DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["header"]).inc();
                             }
                         }
 
@@ -702,6 +683,7 @@ impl HeaderWaiter {
                                 let message = PrimaryMessage::HeadersRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
                                 self.network.lucky_broadcast(addresses, Bytes::from(bytes), INITIAL_SYNC_FANOUT).await;
+                                DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["parent"]).inc();
                             }
                         }
 
@@ -734,9 +716,9 @@ impl HeaderWaiter {
                             let _ = self.batch_requests.remove(x);
                         }
                         let _ = self.parent_requests.remove(&header.parent_cert.header_digest);
-                        DISSEMINATION_RECOVERED_HEADERS_TOTAL.inc();
 
                         if !self.historical_payload_waiters.remove(&header.id) {
+                            DISSEMINATION_RECOVERED_HEADERS_TOTAL.inc();
                             self.tx_core.send(header).await.expect("Failed to send header");
                         }
                     },
@@ -803,9 +785,6 @@ impl HeaderWaiter {
                         .map(|(digest, _)| digest)
                         .collect();
                     if parent_retry.len() > MAX_SYNC_RETRIES_PER_TICK {
-                        DISSEMINATION_RETRY_BUDGET_SKIPS_TOTAL
-                            .with_label_values(&["parent"])
-                            .inc_by((parent_retry.len() - MAX_SYNC_RETRIES_PER_TICK) as u64);
                         parent_retry.truncate(MAX_SYNC_RETRIES_PER_TICK);
                     }
                     for digest in &parent_retry {
@@ -814,13 +793,11 @@ impl HeaderWaiter {
                         }
                     }
                     if !parent_retry.is_empty() {
-                        DISSEMINATION_SYNC_RETRIES_TOTAL
-                            .with_label_values(&["parent"])
-                            .inc_by(parent_retry.len() as u64);
                         let addresses = self.committee.others_primaries(&self.name).iter().map(|(_, x)| x.primary_to_primary).collect();
                         let message = PrimaryMessage::HeadersRequest(parent_retry, self.name);
                         let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
                         self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
+                        DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["parent"]).inc();
                     }
 
                     // Retry header requests with the same budget pattern.
@@ -844,9 +821,6 @@ impl HeaderWaiter {
                         .map(|(digest, _)| digest)
                         .collect();
                     if header_retry.len() > MAX_SYNC_RETRIES_PER_TICK {
-                        DISSEMINATION_RETRY_BUDGET_SKIPS_TOTAL
-                            .with_label_values(&["header"])
-                            .inc_by((header_retry.len() - MAX_SYNC_RETRIES_PER_TICK) as u64);
                         header_retry.truncate(MAX_SYNC_RETRIES_PER_TICK);
                     }
                     for digest in &header_retry {
@@ -855,9 +829,6 @@ impl HeaderWaiter {
                         }
                     }
                     if !header_retry.is_empty() {
-                        DISSEMINATION_SYNC_RETRIES_TOTAL
-                            .with_label_values(&["header"])
-                            .inc_by(header_retry.len() as u64);
                         let addresses = self
                             .committee
                             .others_primaries(&self.name)
@@ -870,6 +841,7 @@ impl HeaderWaiter {
                         self.network
                             .lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes)
                             .await;
+                        DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["header"]).inc();
                     }
 
                     let mut suffix_retry = Vec::new();
@@ -880,9 +852,6 @@ impl HeaderWaiter {
                         }
                     }
                     if !suffix_retry.is_empty() {
-                        DISSEMINATION_SYNC_RETRIES_TOTAL
-                            .with_label_values(&["suffix"])
-                            .inc_by(suffix_retry.len() as u64);
                         for request in suffix_retry {
                             let message = PrimaryMessage::ProposalHeadersRequest(
                                 request.proposal.clone(),
@@ -913,6 +882,7 @@ impl HeaderWaiter {
                                     )
                                     .await;
                             }
+                            DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["header"]).inc();
                         }
                     }
 

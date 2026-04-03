@@ -6,10 +6,6 @@ use crate::{DagError, Height};
 use crate::error::DagResult;
 use crate::header_waiter::{PayloadSyncMode, WaiterMessage};
 use crate::messages::{Certificate, ConsensusMessage, Header, Proposal};
-use crate::metrics::{
-    CONSENSUS_COMMITTER_BLOCKED_TOTAL, CONSENSUS_COMMITTER_WAITS_TOTAL,
-    DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL,
-};
 use crate::primary::Slot;
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
@@ -101,9 +97,6 @@ impl Synchronizer {
             return Ok(false);
         }
 
-        // Track sync request sent
-        DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL.inc();
-
         self.tx_header_waiter
             .send(WaiterMessage::SyncBatches(missing, header.clone(), mode))
             .await
@@ -126,9 +119,6 @@ impl Synchronizer {
     }
 
     pub async fn fetch_header(&mut self, header_digest: Digest) -> DagResult<()> {
-        // Track sync request sent
-        DISSEMINATION_HEADER_SYNC_REQUESTS_SENT_TOTAL.inc();
-
         self.tx_header_waiter
             .send(WaiterMessage::SyncHeader(header_digest))
             .await
@@ -312,12 +302,8 @@ impl Synchronizer {
                 Some(h) => break h,
                 None => {
                     if !counted_header_block {
-                        CONSENSUS_COMMITTER_BLOCKED_TOTAL.inc();
-                        counted_header_block = true;
+                                                counted_header_block = true;
                     }
-                    CONSENSUS_COMMITTER_WAITS_TOTAL
-                        .with_label_values(&["header"])
-                        .inc();
                     debug!("Committer waiting for header {} at height {}", proposal.header_digest, proposal.height);
                     let should_retry_suffix = last_suffix_request_at
                         .map(|timestamp| {
@@ -358,12 +344,8 @@ impl Synchronizer {
                     last_payload_sync_at = Some(time::Instant::now());
                 }
                 if !counted_payload_block {
-                    CONSENSUS_COMMITTER_BLOCKED_TOTAL.inc();
-                    counted_payload_block = true;
+                                        counted_payload_block = true;
                 }
-                CONSENSUS_COMMITTER_WAITS_TOTAL
-                    .with_label_values(&["payload"])
-                    .inc();
                 debug!(
                     "Committer waiting for payload of header {} at height {}",
                     header.id,
@@ -386,12 +368,8 @@ impl Synchronizer {
                     Some(h) => break h,
                     None => {
                         if !counted_parent_block {
-                            CONSENSUS_COMMITTER_BLOCKED_TOTAL.inc();
-                            counted_parent_block = true;
+                                                        counted_parent_block = true;
                         }
-                        CONSENSUS_COMMITTER_WAITS_TOTAL
-                            .with_label_values(&["parent"])
-                            .inc();
                         debug!("Committer waiting for parent of header at height {}", current_height);
                         let should_retry_suffix = last_suffix_request_at
                             .map(|timestamp| {

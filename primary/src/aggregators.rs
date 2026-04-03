@@ -3,7 +3,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult, ConsensusError};
 use crate::messages::{Certificate, Header, Vote, QC, Timeout, TC};
-use crate::metrics::{DISSEMINATION_CERTIFICATES_FORMED_TOTAL, DISSEMINATION_HEADER_TO_CERT_LATENCY};
 use config::{Committee, Stake};
 use crypto::{PublicKey, Signature, Digest};
 use std::collections::HashSet;
@@ -66,13 +65,6 @@ impl VotesAggregator {
                 };
 
                 self.diss_cert = Some(dissemination_cert);
-                // Metric: dissemination certificate formed (f+1 votes)
-                DISSEMINATION_CERTIFICATES_FORMED_TOTAL.inc();
-                // Observe header-to-certificate latency
-                if let Some(start) = self.created_at {
-                    let latency_ms = start.elapsed().as_millis() as f64;
-                    DISSEMINATION_HEADER_TO_CERT_LATENCY.observe(latency_ms);
-                }
             }
             self.complete = true;
             //return Ok(self.diss_cert.clone());

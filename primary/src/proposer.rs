@@ -4,12 +4,12 @@ use std::collections::{BTreeMap, HashMap};
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header, ConsensusMessage};
 use crate::primary::Height;
+use crate::metrics::{DISSEMINATION_HEADERS_CREATED_TOTAL, record_header_created, now_ms};
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService, Hash};
 use log::{debug, info, warn, error};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
-use crate::metrics::{DISSEMINATION_HEADERS_PROPOSED_TOTAL, DISSEMINATION_DAG_NODE_HEIGHT};
 
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
@@ -137,6 +137,9 @@ impl Proposer {
                 self.num_active_instances,
             ).await;
 
+        DISSEMINATION_HEADERS_CREATED_TOTAL.inc();
+        record_header_created(&header.id, now_ms());
+
         if self.is_special {
             header.special = true;
             debug!("Header at height {} is SPECIAL", self.height);
@@ -158,17 +161,12 @@ impl Proposer {
         // Propose time tracking removed - now using slot-level latency
 
         match self.tx_core.try_send(header) {
-            Ok(_) => {
-                DISSEMINATION_HEADERS_PROPOSED_TOTAL.inc();
-                DISSEMINATION_DAG_NODE_HEIGHT.set(self.height as i64);
-            },
+            Ok(_) => {},
             Err(tokio::sync::mpsc::error::TrySendError::Full(h)) => {
                 warn!("PROPOSER: tx_core channel FULL at height {}! Core may be overloaded processing headers", self.height);
                 if let Err(e) = self.tx_core.send(h).await {
                     error!("PROPOSER: CRITICAL - Failed to send header at height {}: {}", self.height, e);
                 }
-                DISSEMINATION_HEADERS_PROPOSED_TOTAL.inc();
-                DISSEMINATION_DAG_NODE_HEIGHT.set(self.height as i64);
             },
             Err(e) => {
                 error!("PROPOSER: CRITICAL - Channel closed at height {}: {}", self.height, e);

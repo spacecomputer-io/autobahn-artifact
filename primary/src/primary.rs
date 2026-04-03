@@ -21,10 +21,6 @@ use crypto::{Digest, PublicKey, SignatureService};
 use futures::sink::SinkExt as _;
 use log::{info, debug, warn, error};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
-use crate::metrics::{
-    record_tx_submit_ms, record_batch_size_bytes, record_tx_count,
-    DISSEMINATION_DIGESTS_OWN_BATCHES_TOTAL, DISSEMINATION_DIGESTS_OTHERS_BATCHES_TOTAL
-};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::process::Command;
@@ -380,13 +376,10 @@ impl MessageHandler for WorkerReceiverHandler {
         match bincode::deserialize(&serialized) {
             Ok(message) => match message {
                 WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes, tx_count) => {
-                    DISSEMINATION_DIGESTS_OWN_BATCHES_TOTAL.inc();
-                    record_batch_size_bytes(&digest, batch_size_bytes);
-                    record_tx_count(&digest, tx_count);
-                    if first_tx_submit_ms > 0 { 
-                        record_tx_submit_ms(&digest, first_tx_submit_ms);
+                    // Record batch creation timestamp for latency tracking.
+                    if first_tx_submit_ms > 0 {
+                        crate::metrics::record_batch_created(&digest, first_tx_submit_ms);
                     }
-                    
                     // Use try_send to detect channel backpressure
                     let digest_copy = digest.clone();
                     match self.tx_our_digests.try_send((digest, worker_id)) {
@@ -405,9 +398,6 @@ impl MessageHandler for WorkerReceiverHandler {
                     }
                 },
                 WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes) => {
-                    DISSEMINATION_DIGESTS_OTHERS_BATCHES_TOTAL.inc();
-                    record_batch_size_bytes(&digest, batch_size_bytes);
-                    
                     // Use try_send to detect channel backpressure
                     let digest_copy = digest.clone();
                     match self.tx_others_digests.try_send((digest, worker_id)) {

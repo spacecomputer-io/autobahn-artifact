@@ -15,8 +15,11 @@ use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
-use crate::metrics::{WORKER_BATCHES_SEALED_TOTAL, WORKER_BATCH_SIZE_BYTES};
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::metrics::{
+    WORKER_INGRESS_BATCHES_CREATED_TOTAL, WORKER_INGRESS_BATCH_BYTES_TOTAL,
+    WORKER_INGRESS_TRANSACTIONS_RECEIVED_TOTAL,
+};
 use crate::processor::SerializedBatchMessage;
 
 #[cfg(test)]
@@ -129,6 +132,7 @@ impl BatchMaker {
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     tx_count += 1;
+                    WORKER_INGRESS_TRANSACTIONS_RECEIVED_TOTAL.inc();
                     
                     if self.current_batch_size >= self.batch_size {
                         self.seal().await;
@@ -234,14 +238,14 @@ impl BatchMaker {
         // NOTE: Removed individual batch size logging - now using aggregate stats
         }
 
+        WORKER_INGRESS_BATCHES_CREATED_TOTAL.inc();
+        WORKER_INGRESS_BATCH_BYTES_TOTAL.inc_by(batch_size_bytes);
+
         // Deliver the batch to our own primary immediately — not gated on broadcast.
         // The primary will include this digest in the next header. Other nodes that
         // don't yet have the batch data will sync it via the normal sync mechanism.
         let submit_ms = self.first_tx_submit_ms.take();
         self.tx_batch.send((serialized.clone(), submit_ms, tx_count)).await.expect("Failed to deliver batch");
-        WORKER_BATCHES_SEALED_TOTAL.inc();
-        WORKER_BATCH_SIZE_BYTES.set(sealed_size as i64);
-
         // Enqueue best-effort broadcast to the background task.
         // Uses try_send so BatchMaker is NEVER blocked by TCP backpressure.
         // If the channel is full (extreme congestion), the broadcast is dropped;

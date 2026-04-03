@@ -9,7 +9,6 @@ use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
-use crate::metrics::WORKER_DIGESTS_SENT_TO_PRIMARY_TOTAL;
 
 #[cfg(test)]
 #[path = "tests/processor_tests.rs"]
@@ -107,9 +106,7 @@ impl Processor {
                 
                 // Try to send with timeout detection
                 match tx_digest.try_send(serialized_message) {
-                    Ok(_) => {
-                        WORKER_DIGESTS_SENT_TO_PRIMARY_TOTAL.inc();
-                    },
+                    Ok(_) => {},
                     Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
                         warn!("WORKER[{}]: Channel to Primary FULL! Batch {} blocked - possible backpressure from primary", 
                               id, digest_copy);
@@ -117,7 +114,6 @@ impl Processor {
                         if tx_digest.send(msg).await.is_err() {
                             error!("WORKER[{}]: Failed to send digest {} after backpressure wait", id, digest_copy);
                         }
-                        WORKER_DIGESTS_SENT_TO_PRIMARY_TOTAL.inc();
                     },
                     Err(e) => {
                         error!("WORKER[{}]: Channel closed - failed to send digest {}: {}", id, digest_copy, e);

@@ -1,12 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::metrics::{
-    WORKER_SYNC_COMPLETIONS_TOTAL, WORKER_SYNC_HEARTBEAT_MS, WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL,
-    WORKER_SYNC_MESSAGE_DIGESTS_TOTAL, WORKER_SYNC_MESSAGES_RECEIVED_TOTAL,
-    WORKER_SYNC_PENDING_BATCHES, WORKER_SYNC_PENDING_DEPENDENTS, WORKER_SYNC_RECOVERY_LATENCY_MS,
-    WORKER_SYNC_REQUESTS_TOTAL, WORKER_SYNC_RETRIES_TOTAL, WORKER_SYNC_RETRY_SENDS_DROPPED_TOTAL,
-    WORKER_SYNC_TARGET_ROTATIONS_TOTAL, WORKER_SYNC_GC_EVICTIONS_TOTAL,
-    WORKER_SYNC_OLDEST_BLOCKED_HEIGHT, WORKER_SYNC_RETRY_BUDGET_SKIPS_TOTAL,
-    WORKER_SYNC_STALLED_BATCHES, WORKER_SYNC_TARGET_COOLDOWNS_TOTAL,
+    WORKER_RECOVERY_PENDING_BATCHES, WORKER_RECOVERY_STALLED_BATCHES,
+    WORKER_RECOVERY_SYNC_REQUESTS_TOTAL,
 };
 use crate::worker::{Round, WorkerMessage};
 use bytes::Bytes;
@@ -33,12 +28,12 @@ const TIMER_RESOLUTION: u64 = 1_000;
 const INITIAL_COMMITTED_SYNC_FANOUT: usize = 3;
 /// Retry only a bounded number of commit-critical digests per timer tick, ordered oldest-first.
 const MAX_COMMIT_CRITICAL_RETRIES_PER_TICK: usize = 128;
-/// A pending batch is considered stalled after this long without local recovery.
-const STALLED_BATCH_THRESHOLD_MS: u128 = 5_000;
 /// Temporarily de-prioritize targets that have been retried this many times for the same digest.
 const TARGET_COOLDOWN_AFTER_ATTEMPTS: u32 = 3;
 /// How long to keep a target on cooldown after repeated unsuccessful attempts.
 const TARGET_COOLDOWN_MS: u128 = 5_000;
+/// A pending batch recovery is considered "stalled" after this many milliseconds.
+const STALLED_BATCH_THRESHOLD_MS: u128 = 5_000;
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 enum SyncPriority {
@@ -51,7 +46,6 @@ struct PendingBatchSync {
     blocked_height: Round,
     cancel: Sender<()>,
     timestamp: u128,
-    first_request_timestamp: u128,
     target: PublicKey,
     priority: SyncPriority,
     dependents: u64,
@@ -91,90 +85,6 @@ pub struct Synchronizer {
 }
 
 impl Synchronizer {
-    fn priority_label(priority: SyncPriority) -> &'static str {
-        match priority {
-            SyncPriority::Background => "background",
-            SyncPriority::CommitCritical => "commit_critical",
-        }
-    }
-
-    fn update_sync_metrics(&self) {
-        let mut background_batches = 0_i64;
-        let mut committed_batches = 0_i64;
-        let mut background_dependents = 0_i64;
-        let mut committed_dependents = 0_i64;
-        let mut background_stalled = 0_i64;
-        let mut committed_stalled = 0_i64;
-        let mut oldest_background_height = i64::MAX;
-        let mut oldest_committed_height = i64::MAX;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Failed to measure time")
-            .as_millis();
-
-        for request in self.pending.values() {
-            match request.priority {
-                SyncPriority::Background => {
-                    background_batches += 1;
-                    background_dependents += request.dependents as i64;
-                    if request.blocked_height != Round::MAX {
-                        oldest_background_height =
-                            oldest_background_height.min(request.blocked_height as i64);
-                    }
-                    if now.saturating_sub(request.first_request_timestamp)
-                        >= STALLED_BATCH_THRESHOLD_MS
-                    {
-                        background_stalled += 1;
-                    }
-                }
-                SyncPriority::CommitCritical => {
-                    committed_batches += 1;
-                    committed_dependents += request.dependents as i64;
-                    oldest_committed_height =
-                        oldest_committed_height.min(request.blocked_height as i64);
-                    if now.saturating_sub(request.first_request_timestamp)
-                        >= STALLED_BATCH_THRESHOLD_MS
-                    {
-                        committed_stalled += 1;
-                    }
-                }
-            }
-        }
-
-        WORKER_SYNC_PENDING_BATCHES
-            .with_label_values(&["background"])
-            .set(background_batches);
-        WORKER_SYNC_PENDING_BATCHES
-            .with_label_values(&["commit_critical"])
-            .set(committed_batches);
-        WORKER_SYNC_PENDING_DEPENDENTS
-            .with_label_values(&["background"])
-            .set(background_dependents);
-        WORKER_SYNC_PENDING_DEPENDENTS
-            .with_label_values(&["commit_critical"])
-            .set(committed_dependents);
-        WORKER_SYNC_STALLED_BATCHES
-            .with_label_values(&["background"])
-            .set(background_stalled);
-        WORKER_SYNC_STALLED_BATCHES
-            .with_label_values(&["commit_critical"])
-            .set(committed_stalled);
-        WORKER_SYNC_OLDEST_BLOCKED_HEIGHT
-            .with_label_values(&["background"])
-            .set(if oldest_background_height == i64::MAX {
-                0
-            } else {
-                oldest_background_height
-            });
-        WORKER_SYNC_OLDEST_BLOCKED_HEIGHT
-            .with_label_values(&["commit_critical"])
-            .set(if oldest_committed_height == i64::MAX {
-                0
-            } else {
-                oldest_committed_height
-            });
-    }
-
     fn candidate_targets(&self) -> Vec<PublicKey> {
         self.committee
             .others_workers(&self.name, &self.id)
@@ -291,11 +201,6 @@ impl Synchronizer {
             return (true, 0);
         }
 
-        let phase = if retry { "retry" } else { "initial" };
-        WORKER_SYNC_REQUESTS_TOTAL
-            .with_label_values(&[Self::priority_label(priority), phase])
-            .inc_by(digests.len() as u64);
-
         let message = WorkerMessage::BatchRequest(digests, self.name);
         let serialized =
             bincode::serialize(&message).expect("Failed to serialize our own message");
@@ -308,6 +213,7 @@ impl Synchronizer {
                 return (false, 0);
             }
         };
+        WORKER_RECOVERY_SYNC_REQUESTS_TOTAL.inc();
         let target_enqueued = self
             .network
             .send_best_effort(target_address, Bytes::from(serialized.clone()));
@@ -342,13 +248,6 @@ impl Synchronizer {
         (target_enqueued, fanout_dropped)
     }
 
-    fn now_ms() -> u128 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Failed to measure time")
-            .as_millis()
-    }
-
     /// Main loop listening to the primary's messages.
     async fn run(&mut self) {
         let mut waiting = FuturesUnordered::new();
@@ -360,9 +259,6 @@ impl Synchronizer {
             tokio::select! {
                 // Handle primary's messages.
                 Some(message) = self.rx_message.recv() => {
-                    WORKER_SYNC_HEARTBEAT_MS
-                        .with_label_values(&["rx_message"])
-                        .set(Self::now_ms() as i64);
                     match message {
                     PrimaryWorkerMessage::Synchronize(digests, target) => {
                         let priority = SyncPriority::Background;
@@ -370,13 +266,6 @@ impl Synchronizer {
                             .duration_since(UNIX_EPOCH)
                             .expect("Failed to measure time")
                             .as_millis();
-
-                        WORKER_SYNC_MESSAGES_RECEIVED_TOTAL
-                            .with_label_values(&["synchronize"])
-                            .inc();
-                        WORKER_SYNC_MESSAGE_DIGESTS_TOTAL
-                            .with_label_values(&["synchronize"])
-                            .inc_by(digests.len() as u64);
 
                         let mut missing = Vec::new();
                         for digest in digests {
@@ -411,7 +300,6 @@ impl Synchronizer {
                                     blocked_height: Round::MAX,
                                     cancel: tx_cancel,
                                     timestamp: now,
-                                    first_request_timestamp: now,
                                     target: target.clone(),
                                     priority,
                                     dependents: 1,
@@ -421,7 +309,7 @@ impl Synchronizer {
                             );
                         }
 
-                        let (target_ok, fanout_drops) =
+                        let (target_ok, _fanout_drops) =
                             self.send_sync_request(missing.clone(), target, priority, false);
                         if !target_ok {
                             // Target enqueue failed — make these digests immediately
@@ -431,17 +319,7 @@ impl Synchronizer {
                                     request.timestamp = 0;
                                 }
                             }
-                            WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL
-                                .inc_by(missing.len() as u64);
                         }
-                        if fanout_drops > 0 {
-                            WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL
-                                .inc_by(fanout_drops as u64);
-                        }
-                        WORKER_SYNC_HEARTBEAT_MS
-                            .with_label_values(&["initial_dispatch"])
-                            .set(Self::now_ms() as i64);
-                        self.update_sync_metrics();
                     }
                     PrimaryWorkerMessage::SynchronizeCommitted(digests, target, blocked_height) => {
                         let priority = SyncPriority::CommitCritical;
@@ -449,13 +327,6 @@ impl Synchronizer {
                             .duration_since(UNIX_EPOCH)
                             .expect("Failed to measure time")
                             .as_millis();
-
-                        WORKER_SYNC_MESSAGES_RECEIVED_TOTAL
-                            .with_label_values(&["synchronize_committed"])
-                            .inc();
-                        WORKER_SYNC_MESSAGE_DIGESTS_TOTAL
-                            .with_label_values(&["synchronize_committed"])
-                            .inc_by(digests.len() as u64);
 
                         let mut missing = Vec::new();
                         for digest in digests {
@@ -490,7 +361,6 @@ impl Synchronizer {
                                     blocked_height,
                                     cancel: tx_cancel,
                                     timestamp: now,
-                                    first_request_timestamp: now,
                                     target: target.clone(),
                                     priority,
                                     dependents: 1,
@@ -500,7 +370,7 @@ impl Synchronizer {
                             );
                         }
 
-                        let (target_ok, fanout_drops) =
+                        let (target_ok, _fanout_drops) =
                             self.send_sync_request(missing.clone(), target, priority, false);
                         if !target_ok {
                             for digest in &missing {
@@ -508,17 +378,7 @@ impl Synchronizer {
                                     request.timestamp = 0;
                                 }
                             }
-                            WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL
-                                .inc_by(missing.len() as u64);
                         }
-                        if fanout_drops > 0 {
-                            WORKER_SYNC_INITIAL_SENDS_DROPPED_TOTAL
-                                .inc_by(fanout_drops as u64);
-                        }
-                        WORKER_SYNC_HEARTBEAT_MS
-                            .with_label_values(&["initial_dispatch"])
-                            .set(Self::now_ms() as i64);
-                        self.update_sync_metrics();
                     }
                     PrimaryWorkerMessage::Cleanup(round) => {
                         // Keep track of the primary's round number.
@@ -547,9 +407,6 @@ impl Synchronizer {
                                 .pending
                                 .get(digest)
                                 .expect("gc eviction digest should remain pending during cleanup");
-                            WORKER_SYNC_GC_EVICTIONS_TOTAL
-                                .with_label_values(&[Self::priority_label(request.priority)])
-                                .inc();
                             let _ = request.cancel.clone().send(()).await;
                         }
                         self.pending.retain(|digest, request| {
@@ -557,31 +414,14 @@ impl Synchronizer {
                                 || request.round > gc_round
                                 || !evicted.contains(digest)
                         });
-                        self.update_sync_metrics();
                     }
                 }},
 
                 // Stream out the futures of the `FuturesUnordered` that completed.
                 Some(result) = waiting.next() => match result {
                     Ok(Some(digest)) => {
-                        WORKER_SYNC_HEARTBEAT_MS
-                            .with_label_values(&["completion"])
-                            .set(Self::now_ms() as i64);
                         // We got the batch, remove it from the pending list.
-                        if let Some(request) = self.pending.remove(&digest) {
-                            WORKER_SYNC_COMPLETIONS_TOTAL
-                                .with_label_values(&[Self::priority_label(request.priority)])
-                                .inc();
-                            let latency_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Failed to measure time")
-                                .as_millis()
-                                .saturating_sub(request.first_request_timestamp);
-                            WORKER_SYNC_RECOVERY_LATENCY_MS
-                                .with_label_values(&[Self::priority_label(request.priority)])
-                                .observe(latency_ms as f64);
-                        }
-                        self.update_sync_metrics();
+                        self.pending.remove(&digest);
                     },
                     Ok(None) => {
                         // The sync request for this batch has been canceled.
@@ -591,9 +431,6 @@ impl Synchronizer {
 
                 // Triggers on timer's expiration.
                 () = &mut timer => {
-                    WORKER_SYNC_HEARTBEAT_MS
-                        .with_label_values(&["tick"])
-                        .set(Self::now_ms() as i64);
                     // We optimistically sent sync requests to a single node. If this timer triggers,
                     // it means we were wrong to trust it. We are done waiting for a reply and we now
                     // broadcast the request to a bunch of other nodes (selected at random).
@@ -629,9 +466,6 @@ impl Synchronizer {
                         .chain(background_retry.into_iter())
                         .collect();
                     if retry_list.len() > MAX_COMMIT_CRITICAL_RETRIES_PER_TICK {
-                        WORKER_SYNC_RETRY_BUDGET_SKIPS_TOTAL
-                            .with_label_values(&["total"])
-                            .inc_by((retry_list.len() - MAX_COMMIT_CRITICAL_RETRIES_PER_TICK) as u64);
                         retry_list.truncate(MAX_COMMIT_CRITICAL_RETRIES_PER_TICK);
                     }
 
@@ -659,23 +493,12 @@ impl Synchronizer {
                                 cooldown_target = Some(next_target.clone());
                                 *attempts = 0;
                             }
-                            if next_target != request.target {
-                                WORKER_SYNC_TARGET_ROTATIONS_TOTAL
-                                    .with_label_values(&[Self::priority_label(request.priority)])
-                                    .inc();
-                            }
                             request.target = next_target.clone();
                             request.attempted_targets.insert(next_target.clone());
-                            WORKER_SYNC_RETRIES_TOTAL
-                                .with_label_values(&[Self::priority_label(request.priority)])
-                                .inc();
                             (request.priority, next_target)
                         };
                         if let Some(target) = cooldown_target {
                             self.target_cooldowns.insert(target, now + TARGET_COOLDOWN_MS);
-                            WORKER_SYNC_TARGET_COOLDOWNS_TOTAL
-                                .with_label_values(&[Self::priority_label(priority)])
-                                .inc();
                         }
                         retry_groups
                             .entry((priority, next_target_for_group))
@@ -683,9 +506,8 @@ impl Synchronizer {
                             .push(digest.clone());
                     }
 
-                    let mut total_dropped = 0_usize;
                     for ((priority, target), digests) in retry_groups {
-                        let (target_enqueued, fanout_dropped) = self
+                        let (target_enqueued, _fanout_dropped) = self
                             .send_sync_request(digests.clone(), target, priority, true);
                         if target_enqueued {
                             // Primary target got the message — a meaningful retry
@@ -696,23 +518,17 @@ impl Synchronizer {
                                 }
                             }
                         }
-                        // Only count drops where the primary target was not reached.
-                        if !target_enqueued {
-                            total_dropped += 1;
-                        }
-                        total_dropped += fanout_dropped;
                     }
-                    if total_dropped > 0 {
-                        WORKER_SYNC_RETRY_SENDS_DROPPED_TOTAL
-                            .inc_by(total_dropped as u64);
-                    }
-                    WORKER_SYNC_HEARTBEAT_MS
-                        .with_label_values(&["retry_dispatch"])
-                        .set(Self::now_ms() as i64);
+
+                    // Update recovery state gauges.
+                    WORKER_RECOVERY_PENDING_BATCHES.set(self.pending.len() as i64);
+                    let stalled = self.pending.values()
+                        .filter(|r| now.saturating_sub(r.timestamp) >= STALLED_BATCH_THRESHOLD_MS)
+                        .count();
+                    WORKER_RECOVERY_STALLED_BATCHES.set(stalled as i64);
 
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
-                    self.update_sync_metrics();
                 },
             }
         }
