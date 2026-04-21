@@ -348,15 +348,12 @@ impl Core {
         debug!("Past header parent cert stake check");
         //println!("After second ensure");
 
-        // Ensure we have the payload. If we don't, the synchronizer will ask our workers to get it, and then
-        // reschedule processing of this header once we have it.
         if self.synchronizer.missing_payload(&header, sync).await? {
             DISSEMINATION_MISSING_PAYLOAD_TOTAL.inc();
             debug!("Processing of {} suspended: missing payload", header);
             return Ok(());
         }
 
-        // By FIFO should have parent of this header (and recursively all ancestors), reschedule for processing if we don't
         if self
             .synchronizer
             .get_parent_header(&header)
@@ -368,17 +365,7 @@ impl Core {
             return Ok(());
         }
 
-
-        
-
-
-        // Check whether we can seamlessly vote for all consensus messages, if not reschedule
-        if !self.is_consensus_ready(&header).await {
-            // TODO: Keep track of stats of sync
-            // NOTE: This blocks if prepare tips are not available, the leader of the prepare takes
-            // on the responsibility of possible blocking i.e. its lane won't continue
-            // TODO: Use reputation
-            //println!("Need to sync on missing tips, reschedule");
+        if !self.is_consensus_ready(&header).await && self.use_optimistic_tips {
             debug!("Can't vote for prepare, need to sync on missing tips, suspending processing");
             return Ok(());
         }
