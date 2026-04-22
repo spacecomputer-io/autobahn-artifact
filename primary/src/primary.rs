@@ -57,6 +57,13 @@ fn current_git_revision() -> Option<String> {
     }
 }
 
+/// Maximum number of headers returned in a single `HeaderRange` response.
+/// Enforced on both client (requester sets a matching from_height window)
+/// and server (response truncated to this count regardless of from_height)
+/// to bound per-request work and prevent a malicious requester from walking
+/// back to genesis in one shot.
+pub const LIVE_SYNC_RANGE_WINDOW: Height = 32;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
     Header(Header, bool),
@@ -71,6 +78,8 @@ pub enum PrimaryMessage {
     HeadersRequest(Vec<Digest>, /* requestor */ PublicKey),
     ProposalHeadersRequest(Proposal, Height, /* requestor */ PublicKey),
     ProposalHeaders(Vec<Header>),
+    HeaderRangeRequest(/* start_digest */ Digest, /* from_height */ Height, /* requestor */ PublicKey),
+    HeaderRange(Vec<Header>),
 }
 
 /// The messages sent by the primary to its workers.
@@ -123,6 +132,7 @@ impl Primary {
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_header_requests, rx_header_requests) = channel(CHANNEL_CAPACITY);
         let (tx_proposal_header_requests, rx_proposal_header_requests) = channel(CHANNEL_CAPACITY);
+        let (tx_header_range_requests, rx_header_range_requests) = channel(CHANNEL_CAPACITY);
         let (tx_instance, rx_instance) = channel(CHANNEL_CAPACITY);
         let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(CHANNEL_CAPACITY);
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
@@ -158,6 +168,7 @@ impl Primary {
                 tx_cert_requests,
                 tx_header_requests,
                 tx_proposal_header_requests,
+                tx_header_range_requests,
             },
         );
         info!(
@@ -298,6 +309,7 @@ impl Primary {
             rx_cert_requests,
             rx_header_requests,
             rx_proposal_header_requests,
+            rx_header_range_requests,
         );
 
         // NOTE: This log entry is used to compute performance.
@@ -320,6 +332,7 @@ struct PrimaryReceiverHandler {
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
     tx_header_requests: Sender<(Vec<Digest>, PublicKey)>,
     tx_proposal_header_requests: Sender<(Proposal, Height, PublicKey)>,
+    tx_header_range_requests: Sender<(Digest, Height, PublicKey)>,
 }
 
 #[async_trait]
@@ -343,6 +356,11 @@ impl MessageHandler for PrimaryReceiverHandler {
             PrimaryMessage::ProposalHeadersRequest(proposal, stop_height, requestor) => self
                 .tx_proposal_header_requests
                 .send((proposal, stop_height, requestor))
+                .await
+                .expect("Failed to send primary message"),
+            PrimaryMessage::HeaderRangeRequest(start_digest, from_height, requestor) => self
+                .tx_header_range_requests
+                .send((start_digest, from_height, requestor))
                 .await
                 .expect("Failed to send primary message"),
             request => {

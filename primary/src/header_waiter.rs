@@ -39,6 +39,8 @@ const INITIAL_SYNC_FANOUT: usize = 3;
 /// Prevents retry storms when thousands of holes accumulate during partition recovery.
 const MAX_SYNC_RETRIES_PER_TICK: usize = 64;
 
+use crate::primary::LIVE_SYNC_RANGE_WINDOW;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PayloadSyncMode {
     Live(bool),
@@ -666,24 +668,39 @@ impl HeaderWaiter {
                                 dependents.push(header);
                             }
 
-                            let mut requires_sync = Vec::new();
-                            if !self.parent_waiters.contains_key(&missing) {
+                            let needs_dispatch = !self.parent_waiters.contains_key(&missing);
+                            if needs_dispatch {
                                 let (tx_cancel, rx_cancel) = channel(1);
                                 self.parent_waiters.insert(missing.clone(), tx_cancel);
                                 let fut = Self::parent_waiter(missing.clone(), self.store.clone(), rx_cancel);
                                 waiting.push(Box::pin(fut));
-                                requires_sync.push(missing.clone());
-                            }
-                            if !requires_sync.is_empty() {
+
                                 let addresses: Vec<_> = self.committee
                                     .others_primaries(&self.name)
                                     .iter()
                                     .map(|(_, x)| x.primary_to_primary)
                                     .collect();
-                                let message = PrimaryMessage::HeadersRequest(requires_sync, self.name);
-                                let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.lucky_broadcast(addresses, Bytes::from(bytes), INITIAL_SYNC_FANOUT).await;
-                                DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["parent"]).inc();
+                                let parent_height = dependents
+                                    .iter()
+                                    .map(|h| h.parent_cert.height())
+                                    .max()
+                                    .unwrap_or(0);
+                                let from_height = parent_height
+                                    .saturating_sub(LIVE_SYNC_RANGE_WINDOW.saturating_sub(1))
+                                    .max(1);
+                                let message = PrimaryMessage::HeaderRangeRequest(
+                                    missing.clone(),
+                                    from_height,
+                                    self.name,
+                                );
+                                let bytes = bincode::serialize(&message)
+                                    .expect("Failed to serialize header range request");
+                                self.network
+                                    .lucky_broadcast(addresses, Bytes::from(bytes), INITIAL_SYNC_FANOUT)
+                                    .await;
+                                DISSEMINATION_SYNC_REQUESTS_TOTAL
+                                    .with_label_values(&["parent"])
+                                    .inc();
                             }
                         }
 

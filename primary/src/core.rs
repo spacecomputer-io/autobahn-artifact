@@ -1824,6 +1824,47 @@ impl Core {
         Ok(())
     }
 
+    async fn process_header_range(&mut self, headers: Vec<Header>) -> DagResult<()> {
+        // Headers are ordered oldest-first. We require each header to pass
+        // sanitization (signature + committee + freshness) before feeding it
+        // into the vote path — the regular `Header` dispatch calls
+        // `sanitize_header` for this exact reason. Without it a malicious
+        // peer could craft a forged Vec<Header> and have the voter sign it.
+        //
+        // We also stop on the first header that fails to land in the store
+        // after `process_header`: a header that suspends (missing parent,
+        // missing payload, etc.) is not written, and every subsequent header
+        // in the range will then see its own parent as missing and emit a
+        // fresh SyncParent → HeaderRangeRequest. That turns one dropped tail
+        // into up to W new range requests. Letting the single SyncParent
+        // from the suspended header drive the next range is sufficient and
+        // avoids the fan-out.
+        for header in headers {
+            if let Err(e) = self.sanitize_header(&header) {
+                warn!("Dropping HeaderRange on failed sanitization: {:?}", e);
+                break;
+            }
+            let digest = header.digest();
+            // Matches the single-header helper response (helper.rs sends
+            // `PrimaryMessage::Header(header, true)`): sync=true triggers the
+            // HeaderWaiter's active `Synchronize` to workers for any missing
+            // batches, rather than passively registering a waiter.
+            if let Err(e) = self.process_header(header, true).await {
+                warn!("Error processing header from HeaderRange: {:?}", e);
+                break;
+            }
+            // Suspended (e.g. gate 2 parent missing) headers are not stored.
+            // A store-miss means every subsequent header in this range will
+            // also suspend on the same chain — stop here. Real store errors
+            // propagate up via `?`; only `Ok(None)` (not-stored) should break.
+            match self.store.read(digest.to_vec()).await? {
+                Some(_) => {}
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
     async fn process_recovered_proposal_headers(&mut self, headers: Vec<Header>) -> DagResult<()> {
         if let Some(last_header) = headers.last() {
             // Helper replies are reversed to oldest->newest, so `last()` is the
@@ -2343,6 +2384,10 @@ impl Core {
                         PrimaryMessage::ProposalHeaders(headers) => {
                             headers_processed += headers.len() as u64;
                             self.process_recovered_proposal_headers(headers).await
+                        },
+                        PrimaryMessage::HeaderRange(headers) => {
+                            headers_processed += headers.len() as u64;
+                            self.process_header_range(headers).await
                         },
                         _ => panic!("Unexpected core message")
                     };
