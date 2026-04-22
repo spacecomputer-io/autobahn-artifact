@@ -166,7 +166,15 @@ impl Connection {
                         tokio::select! {
                             // Wait an increasing delay before attempting to reconnect.
                             () = &mut timer => {
-                                delay = min(2*delay, 60_000);
+                                // Cap exponential backoff at 2s. With the original 60s cap,
+                                // a transient TCP bind race at coordinated startup (one peer's
+                                // listen() finishing a few hundred ms after another's first
+                                // connect attempt) could eat ~25-50s before the next retry,
+                                // delaying epoch-synchronized primary startup by tens of seconds.
+                                // 2s max lets us reconnect within a couple of seconds of the peer
+                                // becoming available without generating excessive attempts for a
+                                // genuinely down peer.
+                                delay = min(2*delay, 2_000);
                                 retry +=1;
                                 break 'waiter;
                             },
