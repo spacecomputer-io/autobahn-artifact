@@ -89,7 +89,7 @@ impl Processor {
                         let ts = first_tx_at_ms.unwrap_or(0);
                         WorkerPrimaryMessage::OurBatch(digest, id, ts, batch_size_bytes, tx_count)
                     },
-                    false => WorkerPrimaryMessage::OthersBatch(digest, id, batch_size_bytes),
+                    false => WorkerPrimaryMessage::OthersBatch(digest, id, batch_size_bytes, tx_count),
                 };
                 
                 let serialized_message = match bincode::serialize(&message) {

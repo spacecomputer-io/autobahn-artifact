@@ -107,6 +107,20 @@ lazy_static! {
         )
         .expect("failed to register consensus_slow_path_commits_total");
 
+    pub static ref CONSENSUS_TRANSACTIONS_COMMITTED_TOTAL: IntCounter =
+        register_int_counter!(
+            "consensus_transactions_committed_total",
+            "Total transactions committed"
+        )
+        .expect("failed to register consensus_transactions_committed_total");
+
+    pub static ref CONSENSUS_TRANSACTIONS_EXECUTED_TOTAL: IntCounter =
+        register_int_counter!(
+            "consensus_transactions_executed_total",
+            "Total transactions executed"
+        )
+        .expect("failed to register consensus_transactions_executed_total");
+
     // ============================================================================
     // CONSENSUS BEHAVIOR COUNTERS
     // ============================================================================
@@ -187,6 +201,9 @@ lazy_static! {
     pub static ref BATCH_CREATION_TIMESTAMPS: Mutex<HashMap<Digest, u64>> =
         Mutex::new(HashMap::new());
 
+    pub static ref BATCH_TX_COUNTS: Mutex<HashMap<Digest, (u64, u64)>> =
+        Mutex::new(HashMap::new());
+
     /// Maps header digest -> creation timestamp (ms) for header lifecycle latency.
     pub static ref HEADER_CREATION_TIMESTAMPS: Mutex<HashMap<Digest, u64>> =
         Mutex::new(HashMap::new());
@@ -211,6 +228,13 @@ pub fn record_batch_created(digest: &Digest, timestamp_ms: u64) {
         .lock()
         .unwrap()
         .insert(digest.clone(), timestamp_ms);
+}
+
+pub fn record_batch_tx_count(digest: &Digest, tx_count: u64) {
+    BATCH_TX_COUNTS
+        .lock()
+        .unwrap()
+        .insert(digest.clone(), (now_ms(), tx_count));
 }
 
 /// Record a header creation timestamp for later latency computation.
@@ -238,6 +262,17 @@ pub fn observe_batches_committed(batch_digests: &[Digest], commit_timestamp_ms: 
             LATENCY_TX_TO_SLOT_COMMIT_MS.observe(latency as f64);
         }
     }
+    drop(timestamps);
+
+    let tx_counts = BATCH_TX_COUNTS.lock().unwrap();
+    let total_tx: u64 = batch_digests
+        .iter()
+        .filter_map(|d| tx_counts.get(d).map(|(_, count)| *count))
+        .sum();
+    drop(tx_counts);
+    if total_tx > 0 {
+        CONSENSUS_TRANSACTIONS_COMMITTED_TOTAL.inc_by(total_tx);
+    }
 }
 
 /// Observe tx-to-execute latency for batches in an executed slot.
@@ -248,6 +283,17 @@ pub fn observe_batches_executed(batch_digests: &[Digest], execute_timestamp_ms: 
             let latency = execute_timestamp_ms.saturating_sub(created_ms);
             LATENCY_TX_TO_SLOT_EXECUTE_MS.observe(latency as f64);
         }
+    }
+    drop(timestamps);
+
+    let mut tx_counts = BATCH_TX_COUNTS.lock().unwrap();
+    let total_tx: u64 = batch_digests
+        .iter()
+        .filter_map(|d| tx_counts.remove(d).map(|(_, count)| count))
+        .sum();
+    drop(tx_counts);
+    if total_tx > 0 {
+        CONSENSUS_TRANSACTIONS_EXECUTED_TOTAL.inc_by(total_tx);
     }
 }
 
@@ -274,4 +320,8 @@ pub fn gc_batch_timestamps(max_age_ms: u64) {
         .lock()
         .unwrap()
         .retain(|_, &mut ts| ts > cutoff);
+    BATCH_TX_COUNTS
+        .lock()
+        .unwrap()
+        .retain(|_, (ts, _)| *ts > cutoff);
 }

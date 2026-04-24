@@ -171,16 +171,7 @@ impl Worker {
 
     /// Spawn all tasks responsible to handle clients transactions.
     fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {  //tx_primary: channel between processor and PrimaryConnector
-        // Experiment: grow the TxReceiver→BatchMaker channel to absorb ~5s of
-        // client load (4k tx/s × ~500B = ~10 MB worst case) during post-heal
-        // catch-up storms. If `tx_batch_maker.send().await` blocks while
-        // BatchMaker is CPU-starved by Synchronizer/Processor catch-up work,
-        // the per-connection network task can't drain the kernel recv buffer
-        // and testrpc gets TCP-throttled — visible as the cut-node tx_ingress
-        // dip to ~40% of baseline for ~15s post-heal. If this buffer alone
-        // absorbs the stall, the dip disappears. If not, the fix needs to
-        // move upstream (see spawn_blocking on SHA-512 / bincode).
-        let (tx_batch_maker, rx_batch_maker) = channel(20_000);
+        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
         //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
 

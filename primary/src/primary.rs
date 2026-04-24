@@ -99,7 +99,7 @@ pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
     OurBatch(Digest, WorkerId, /* first_tx_submit_ms */ u64, /* batch_size_bytes */ u64, /* tx_count */ u64),
     /// The worker indicates it received a batch's digest from another authority.
-    OthersBatch(Digest, WorkerId, /* batch_size_bytes */ u64),
+    OthersBatch(Digest, WorkerId, /* batch_size_bytes */ u64, /* tx_count */ u64),
 }
 
 pub struct Primary;
@@ -398,6 +398,7 @@ impl MessageHandler for WorkerReceiverHandler {
                     if first_tx_submit_ms > 0 {
                         crate::metrics::record_batch_created(&digest, first_tx_submit_ms);
                     }
+                    crate::metrics::record_batch_tx_count(&digest, tx_count);
                     // Use try_send to detect channel backpressure
                     let digest_copy = digest.clone();
                     match self.tx_our_digests.try_send((digest, worker_id)) {
@@ -415,7 +416,8 @@ impl MessageHandler for WorkerReceiverHandler {
                         }
                     }
                 },
-                WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes) => {
+                WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes, tx_count) => {
+                    crate::metrics::record_batch_tx_count(&digest, tx_count);
                     // Use try_send to detect channel backpressure
                     let digest_copy = digest.clone();
                     match self.tx_others_digests.try_send((digest, worker_id)) {
