@@ -171,7 +171,7 @@ impl Worker {
 
     /// Spawn all tasks responsible to handle clients transactions.
     fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {  //tx_primary: channel between processor and PrimaryConnector
-        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
+        let (tx_batch_maker, rx_batch_maker) = channel(20_000);      //channel between TxReceive (Client) and batch maker
         //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
 
