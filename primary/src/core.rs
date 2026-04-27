@@ -120,6 +120,12 @@ pub struct Core {
     /// Used to compute the LATENCY_CONSENSUS_SLOT_COMMIT_MS histogram (Prepare → Commit
     /// at the leader, labeled by fast/slow path). Entry is removed at Commit emission.
     prepare_emit_times: HashMap<(Slot, View), std::time::Instant>,
+    /// Slots whose fast-path timer has already fired — i.e., the leader has
+    /// committed to the slow path (Confirm fallback). Used to suppress
+    /// spurious fast-path observations from late Prepare votes that arrive
+    /// after Confirm has been emitted, so the slow-path observe at the
+    /// Confirm-QC site can record the actual end-to-end latency.
+    slot_timer_fired: HashSet<(Slot, View)>,
     tx_info: Sender<ConsensusMessage>,
     leader_elector: LeaderElector,
     timeout_delay: u64,
@@ -216,6 +222,7 @@ impl Core {
                 consensus_cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 already_proposed_slots: HashSet::new(),
                 prepare_emit_times: HashMap::with_capacity(2 * gc_depth as usize),
+                slot_timer_fired: HashSet::with_capacity(2 * gc_depth as usize),
                 current_proposal_tips: HashMap::with_capacity(2 * gc_depth as usize),
                 current_certified_tips: HashMap::with_capacity(2 * gc_depth as usize),
                 consensus_instances: HashMap::with_capacity(2 * gc_depth as usize),
@@ -630,6 +637,12 @@ impl Core {
                 false => qc_maker.append(vote.author, (digest.clone(), sig.clone()), &self.committee)?,
                 true => {
                     qc_maker.try_fast = false; //turn back to normal path handling
+                    // Mark this slot as having fallen back to the slow path so
+                    // late Prepare votes that still trigger a fast QC don't
+                    // steal the latency observation from the Confirm-phase site.
+                    if let ConsensusMessage::Prepare {slot: ps, view: pv, ..} = current_instance {
+                        self.slot_timer_fired.insert((*ps, *pv));
+                    }
                     qc_maker.get_qc()?
                 }
             };
@@ -686,10 +699,15 @@ impl Core {
                                     debug!("taking fast path!");
                                     CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
                                     // Observe Prepare->Commit latency for the fast path at this leader.
-                                    if let Some(start) = self.prepare_emit_times.remove(&(*slot, *view)) {
-                                        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                                        LATENCY_CONSENSUS_SLOT_COMMIT_MS
-                                            .with_label_values(&["fast"]).observe(elapsed_ms);
+                                    // Suppress if the timer already fired for this slot (the slot
+                                    // has fallen back to the slow path; the Confirm-phase observe
+                                    // will record the actual latency).
+                                    if !self.slot_timer_fired.contains(&(*slot, *view)) {
+                                        if let Some(start) = self.prepare_emit_times.remove(&(*slot, *view)) {
+                                            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                            LATENCY_CONSENSUS_SLOT_COMMIT_MS
+                                                .with_label_values(&["fast"]).observe(elapsed_ms);
+                                        }
                                     }
                                     ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                     }, // Create Commit if we have FastPrepareQC
@@ -715,6 +733,7 @@ impl Core {
                                 LATENCY_CONSENSUS_SLOT_COMMIT_MS
                                     .with_label_values(&["slow"]).observe(elapsed_ms);
                             }
+                            self.slot_timer_fired.remove(&(*slot, *view));
                             let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
                             // Send this new instance to the proposer
@@ -851,6 +870,11 @@ impl Core {
             false => qc_maker.append(vote.author, (vote.digest.clone(), vote.sig.clone()), &self.committee)?,
             true => {
                 qc_maker.try_fast = false; //turn back to normal path handling
+                // Mark this slot as having fallen back to the slow path (see
+                // matching comment in process_vote for the rationale).
+                if let ConsensusMessage::Prepare {slot: ps, view: pv, ..} = current_instance {
+                    self.slot_timer_fired.insert((*ps, *pv));
+                }
                 qc_maker.get_qc()?
             }
         };
@@ -900,10 +924,13 @@ impl Core {
                                 debug!("taking fast path!");
                                 CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
                                 // Observe Prepare->Commit latency for the fast path at this leader.
-                                if let Some(start) = self.prepare_emit_times.remove(&(*slot, *view)) {
-                                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                                    LATENCY_CONSENSUS_SLOT_COMMIT_MS
-                                        .with_label_values(&["fast"]).observe(elapsed_ms);
+                                // Suppress if the timer already fired for this slot.
+                                if !self.slot_timer_fired.contains(&(*slot, *view)) {
+                                    if let Some(start) = self.prepare_emit_times.remove(&(*slot, *view)) {
+                                        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                        LATENCY_CONSENSUS_SLOT_COMMIT_MS
+                                            .with_label_values(&["fast"]).observe(elapsed_ms);
+                                    }
                                 }
                                 ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                 }, // Create Commit if we have FastPrepareQC
@@ -924,6 +951,7 @@ impl Core {
                             LATENCY_CONSENSUS_SLOT_COMMIT_MS
                                 .with_label_values(&["slow"]).observe(elapsed_ms);
                         }
+                        self.slot_timer_fired.remove(&(*slot, *view));
                         let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
                         // continue with next consensus phase
