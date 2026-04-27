@@ -12,6 +12,13 @@ const LATENCY_BUCKETS_MS: &[f64] = &[
     1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
 ];
 
+/// Bucket boundaries for the fast-path gap (Δ = T_unanimous − T_quorum) in milliseconds.
+/// Finer resolution near typical fast_path_timeout values (50–200 ms) so that p(δ) for
+/// candidate δ values can be read directly off the histogram.
+const FAST_PATH_GAP_BUCKETS_MS: &[f64] = &[
+    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 500.0, 1000.0, 2500.0,
+];
+
 lazy_static! {
     // ============================================================================
     // DISSEMINATION THROUGHPUT COUNTERS
@@ -192,6 +199,19 @@ lazy_static! {
             LATENCY_BUCKETS_MS.to_vec()
         )
         .expect("failed to register latency_slot_commit_to_execute_ms");
+
+    /// Fast-path gap Δ = T_unanimous − T_quorum (ms): time at the leader between
+    /// the slow-quorum vote (cumulative stake reaches 2f+1) and the unanimous vote
+    /// (cumulative stake reaches 3f+1) for a Prepare QC. Observed once per Prepare
+    /// QC that reaches unanimity, regardless of whether the fast path actually
+    /// fired in time. This is the F(Δ) distribution that drives the fast-path wager.
+    pub static ref CONSENSUS_FAST_PATH_GAP_MS: Histogram =
+        register_histogram!(
+            "consensus_fast_path_gap_ms",
+            "Time between the 2f+1 and 3f+1 vote at the Prepare leader (ms), per Prepare QC reaching unanimity",
+            FAST_PATH_GAP_BUCKETS_MS.to_vec()
+        )
+        .expect("failed to register consensus_fast_path_gap_ms");
 
     // ============================================================================
     // INTERNAL STATE: TIMESTAMP TRACKING FOR LATENCY COMPUTATION
