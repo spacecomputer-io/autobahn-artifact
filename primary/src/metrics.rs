@@ -1,8 +1,8 @@
 use crypto::Digest;
 use lazy_static::lazy_static;
 use prometheus::{
-    register_histogram, register_int_counter, register_int_counter_vec, register_int_gauge,
-    Histogram, IntCounter, IntCounterVec, IntGauge,
+    register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -212,6 +212,20 @@ lazy_static! {
             FAST_PATH_GAP_BUCKETS_MS.to_vec()
         )
         .expect("failed to register consensus_fast_path_gap_ms");
+
+    /// Per-slot consensus latency: time from Prepare emission to Commit emission
+    /// at the leader (ms), labeled by which path was taken
+    /// (fast = skipped Confirm, slow = went through Confirm). One observation
+    /// per committed slot at its leader. The fast/slow median difference is the
+    /// saved Confirm RTT (R in the wager inequality).
+    pub static ref LATENCY_CONSENSUS_SLOT_COMMIT_MS: HistogramVec =
+        register_histogram_vec!(
+            "latency_consensus_slot_commit_ms",
+            "Per-slot consensus latency from Prepare emission to Commit emission at the leader (ms), by path",
+            &["path"],
+            FAST_PATH_GAP_BUCKETS_MS.to_vec()
+        )
+        .expect("failed to register latency_consensus_slot_commit_ms");
 
     // ============================================================================
     // INTERNAL STATE: TIMESTAMP TRACKING FOR LATENCY COMPUTATION

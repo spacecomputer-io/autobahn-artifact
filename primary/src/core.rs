@@ -8,6 +8,7 @@ use crate::metrics::{
     CONSENSUS_SLOTS_COMMITTED_TOTAL, CONSENSUS_VIEW_CHANGES_TOTAL,
     DISSEMINATION_HEADERS_POA_TOTAL,
     DISSEMINATION_MISSING_PARENT_TOTAL, DISSEMINATION_MISSING_PAYLOAD_TOTAL,
+    LATENCY_CONSENSUS_SLOT_COMMIT_MS,
     now_ms, observe_header_poa, record_slot_committed,
 };
 //use crate::common::special_header;
@@ -115,6 +116,10 @@ pub struct Core {
     tc_makers: HashMap<(Slot, View), TCMaker>,
     prepare_tickets: VecDeque<ConsensusMessage>,
     already_proposed_slots: HashSet<Slot>,
+    /// Per-leader timestamp of when each Prepare for (slot, view) was emitted.
+    /// Used to compute the LATENCY_CONSENSUS_SLOT_COMMIT_MS histogram (Prepare → Commit
+    /// at the leader, labeled by fast/slow path). Entry is removed at Commit emission.
+    prepare_emit_times: HashMap<(Slot, View), std::time::Instant>,
     tx_info: Sender<ConsensusMessage>,
     leader_elector: LeaderElector,
     timeout_delay: u64,
@@ -210,6 +215,7 @@ impl Core {
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 consensus_cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 already_proposed_slots: HashSet::new(),
+                prepare_emit_times: HashMap::with_capacity(2 * gc_depth as usize),
                 current_proposal_tips: HashMap::with_capacity(2 * gc_depth as usize),
                 current_certified_tips: HashMap::with_capacity(2 * gc_depth as usize),
                 consensus_instances: HashMap::with_capacity(2 * gc_depth as usize),
@@ -679,6 +685,12 @@ impl Core {
                                 true => {
                                     debug!("taking fast path!");
                                     CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
+                                    // Observe Prepare->Commit latency for the fast path at this leader.
+                                    if let Some(start) = self.prepare_emit_times.remove(&(*slot, *view)) {
+                                        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                        LATENCY_CONSENSUS_SLOT_COMMIT_MS
+                                            .with_label_values(&["fast"]).observe(elapsed_ms);
+                                    }
                                     ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                     }, // Create Commit if we have FastPrepareQC
                                 false => ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() },
@@ -695,6 +707,14 @@ impl Core {
                         => {
                             debug!("Commit QC formed in slot {:?}", slot);
                             CONSENSUS_SLOW_PATH_COMMITS_TOTAL.inc();
+                            // Observe Prepare->Commit latency for the slow path at this leader.
+                            // The start time was inserted at Prepare construction; this fires
+                            // after the full Prepare + Confirm round trips have completed.
+                            if let Some(start) = self.prepare_emit_times.remove(&(*slot, *view)) {
+                                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                LATENCY_CONSENSUS_SLOT_COMMIT_MS
+                                    .with_label_values(&["slow"]).observe(elapsed_ms);
+                            }
                             let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
                             // Send this new instance to the proposer
@@ -879,6 +899,12 @@ impl Core {
                             true => {
                                 debug!("taking fast path!");
                                 CONSENSUS_FAST_PATH_COMMITS_TOTAL.inc();
+                                // Observe Prepare->Commit latency for the fast path at this leader.
+                                if let Some(start) = self.prepare_emit_times.remove(&(*slot, *view)) {
+                                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                    LATENCY_CONSENSUS_SLOT_COMMIT_MS
+                                        .with_label_values(&["fast"]).observe(elapsed_ms);
+                                }
                                 ConsensusMessage::Commit {slot: *slot, view: *view,  qc, proposals: proposals.clone() }
                                 }, // Create Commit if we have FastPrepareQC
                             false => ConsensusMessage::Confirm {slot: *slot, view: *view,  qc, proposals: proposals.clone() },
@@ -892,6 +918,12 @@ impl Core {
                     => {
                         debug!("Commit QC formed in slot {:?}", slot);
                         CONSENSUS_SLOW_PATH_COMMITS_TOTAL.inc();
+                        // Observe Prepare->Commit latency for the slow path at this leader.
+                        if let Some(start) = self.prepare_emit_times.remove(&(*slot, *view)) {
+                            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            LATENCY_CONSENSUS_SLOT_COMMIT_MS
+                                .with_label_values(&["slow"]).observe(elapsed_ms);
+                        }
                         let new_consensus_message = ConsensusMessage::Commit {slot: *slot, view: *view, qc, proposals: proposals.clone(),};
 
                         // continue with next consensus phase
@@ -1130,6 +1162,10 @@ impl Core {
                         qc_ticket,
                         proposals: HashMap::new(), //new_proposals,
                     };
+
+                    // Record Prepare emission time for the per-slot consensus-latency metric.
+                    // Looked up and observed when this leader emits Commit (fast or slow path).
+                    self.prepare_emit_times.insert((slot + 1, 1), std::time::Instant::now());
 
                     //println!("The new slot is {:?}", slot + 1);
                     self.already_proposed_slots.insert(slot + 1);
@@ -2102,6 +2138,11 @@ impl Core {
                 qc_ticket: None,
                 proposals: winning_proposals.clone(),
             };
+
+            // Record Prepare emission time for the per-slot consensus-latency metric.
+            // Same as the view-1 Prepare construction site; this is the view-change branch.
+            self.prepare_emit_times.insert((tc.slot, tc.view + 1), std::time::Instant::now());
+
             if self.use_ride_share {
                 self.tx_info
                 .send(prepare_message.clone())
