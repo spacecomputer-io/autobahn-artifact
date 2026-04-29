@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use log::{info, warn};
+use crate::metrics::NETWORK_MESSAGES_TOTAL;
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
@@ -42,7 +43,7 @@ impl SimpleSender {
 
     /// Helper function to spawn a new connection.
     fn spawn_connection(address: SocketAddr) -> Sender<Bytes> {
-        let (tx, rx) = channel(1_000);
+        let (tx, rx) = channel(5_000);
         Connection::spawn(address, rx);
         tx
     }
@@ -50,6 +51,7 @@ impl SimpleSender {
     /// Try (best-effort) to send a message to a specific address.
     /// This is useful to answer sync requests.
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
+        NETWORK_MESSAGES_TOTAL.with_label_values(&["send"]).inc();
         // Try to re-use an existing connection if possible.
         if let Some(tx) = self.connections.get(&address) {
             if tx.send(data.clone()).await.is_ok() {
@@ -69,6 +71,71 @@ impl SimpleSender {
         for address in addresses {
             self.send(address, data.clone()).await;
         }
+    }
+
+    /// Non-blocking best-effort broadcast: enqueue the message to each peer's channel
+    /// without waiting. If a peer's channel is full (backpressure), the send to that
+    /// peer is silently dropped — the caller must rely on sync/recovery for missed data.
+    /// This is intended for batch data broadcast where the sync protocol handles gaps.
+    pub fn broadcast_best_effort(&mut self, addresses: Vec<SocketAddr>, data: Bytes) -> usize {
+        let mut dropped = 0;
+        for address in addresses {
+            NETWORK_MESSAGES_TOTAL.with_label_values(&["send"]).inc();
+            if let Some(tx) = self.connections.get(&address) {
+                match tx.try_send(data.clone()) {
+                    Ok(()) => continue,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        dropped += 1;
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        // Connection died — spawn a fresh one and try once
+                    }
+                }
+            }
+            // No existing connection or it was closed — spawn a new one
+            let tx = Self::spawn_connection(address);
+            if tx.try_send(data.clone()).is_err() {
+                dropped += 1;
+            } else {
+                self.connections.insert(address, tx);
+            }
+        }
+        dropped
+    }
+
+    /// Non-blocking best-effort send: enqueue the message to the peer's channel without
+    /// waiting. Returns true if enqueued, false if dropped (channel full or closed).
+    pub fn send_best_effort(&mut self, address: SocketAddr, data: Bytes) -> bool {
+        NETWORK_MESSAGES_TOTAL.with_label_values(&["send"]).inc();
+        if let Some(tx) = self.connections.get(&address) {
+            match tx.try_send(data.clone()) {
+                Ok(()) => return true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => return false,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Connection died — spawn a fresh one below
+                }
+            }
+        }
+        let tx = Self::spawn_connection(address);
+        let ok = tx.try_send(data).is_ok();
+        if ok {
+            self.connections.insert(address, tx);
+        }
+        ok
+    }
+
+    /// Non-blocking lucky_broadcast: pick `nodes` addresses at random and send best-effort.
+    /// Returns the number of sends that were dropped due to backpressure.
+    pub fn lucky_broadcast_best_effort(
+        &mut self,
+        mut addresses: Vec<SocketAddr>,
+        data: Bytes,
+        nodes: usize,
+    ) -> usize {
+        addresses.shuffle(&mut self.rng);
+        addresses.truncate(nodes);
+        self.broadcast_best_effort(addresses, data)
     }
 
     /// Pick a few addresses at random (specified by `nodes`) and try (best-effort) to send the
@@ -104,7 +171,13 @@ impl Connection {
     async fn run(&mut self) {
         // Try to connect to the peer.
         let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
-            Ok(stream) => Framed::new(stream, LengthDelimitedCodec::new()).split(),
+            Ok(stream) => {
+                // Enable TCP_NODELAY to disable Nagle's algorithm for low-latency communication
+                if let Err(e) = stream.set_nodelay(true) {
+                    warn!("Failed to set TCP_NODELAY for connection to {}: {}", self.address, e);
+                }
+                Framed::new(stream, LengthDelimitedCodec::new()).split()
+            },
             Err(e) => {
                 warn!(
                     "{}",
@@ -122,6 +195,8 @@ impl Connection {
                 Some(data) = self.receiver.recv() => {
                     if let Err(e) = writer.send(data).await {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
+                        // Count failed send on send side
+                        NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_send"]).inc();
                         return;
                     }
                 },
@@ -133,6 +208,7 @@ impl Connection {
                         _ => {
                             // Something has gone wrong (either the channel dropped or we failed to read from it).
                             warn!("{}", NetworkError::FailedToReceiveAck(self.address));
+                            NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_send"]).inc();
                             return;
                         }
                     }
@@ -141,3 +217,5 @@ impl Connection {
         }
     }
 }
+
+// shared counters are in network::metrics

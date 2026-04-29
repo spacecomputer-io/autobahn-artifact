@@ -5,6 +5,9 @@ use bytes::Bytes;
 use futures::stream::SplitSink;
 use futures::stream::StreamExt as _;
 use log::{debug, info, warn};
+use lazy_static::lazy_static;
+use crate::metrics::{NETWORK_CONNECTED_PEERS, NETWORK_MESSAGES_TOTAL};
+use prometheus::{register_int_counter, IntCounter};
 use std::error::Error;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
@@ -51,6 +54,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
             .expect("Failed to bind TCP port");
 
         debug!("Listening on {}", self.address);
+        NET_LISTENERS_BOUND_TOTAL.inc();
         loop {
             let (socket, peer) = match listener.accept().await {
                 Ok(value) => value,
@@ -60,6 +64,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                 }
             };
             info!("Incoming connection established with {}", peer);
+            NETWORK_CONNECTED_PEERS.inc();
             Self::spawn_runner(socket, peer, self.handler.clone()).await;
         }
     }
@@ -68,23 +73,39 @@ impl<Handler: MessageHandler> Receiver<Handler> {
     /// using the provided handler.
     async fn spawn_runner(socket: TcpStream, peer: SocketAddr, handler: Handler) {
         tokio::spawn(async move {
+            // Disable Nagle's algorithm so small consensus messages are flushed immediately.
+            if let Err(e) = socket.set_nodelay(true) {
+                warn!("Failed to set TCP_NODELAY for connection from {}: {}", peer, e);
+            }
+            
             let transport = Framed::new(socket, LengthDelimitedCodec::new());
             let (mut writer, mut reader) = transport.split();
             while let Some(frame) = reader.next().await {
                 match frame.map_err(|e| NetworkError::FailedToReceiveMessage(peer, e)) {
                     Ok(message) => {
+                        NETWORK_MESSAGES_TOTAL.with_label_values(&["recv"]).inc();
                         if let Err(e) = handler.dispatch(&mut writer, message.freeze()).await {
                             warn!("{}", e);
+                            NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_recv"]).inc();
                             return;
                         }
                     }
                     Err(e) => {
                         warn!("{}", e);
+                        NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_recv"]).inc();
                         return;
                     }
                 }
             }
             warn!("Connection closed by peer {}", peer);
+            NETWORK_CONNECTED_PEERS.dec();
         });
     }
+}
+
+lazy_static! {
+    static ref NET_LISTENERS_BOUND_TOTAL: IntCounter = register_int_counter!(
+        "network_listeners_bound_total",
+        "Total number of receivers bound"
+    ).expect("failed to register network_listeners_bound_total");
 }

@@ -4,15 +4,19 @@
 use crate::{DagError, Height};
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::DagResult;
-use crate::header_waiter::WaiterMessage;
+use crate::header_waiter::{PayloadSyncMode, WaiterMessage};
 use crate::messages::{Certificate, ConsensusMessage, Header, Proposal};
-use config::Committee;
+use crate::primary::Slot;
+use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::debug;
 use std::collections::HashMap;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time;
+
+const COMMITTER_RECOVERY_RETRY_BACKOFF_MS: u64 = 5_000;
 
 /// The `Synchronizer` checks if we have all batches and parents referenced by a header. If we don't, it sends
 /// a command to the `Waiter` to request the missing data.
@@ -47,13 +51,13 @@ impl Synchronizer {
         }
     }
 
-    /// Returns `true` if we have all transactions of the payload. If we don't, we return false,
-    /// synchronize with other nodes (through our workers), and re-schedule processing of the
-    /// header for when we will have its complete payload.
-    pub async fn missing_payload(&mut self, header: &Header, force_sync: bool) -> DagResult<bool> {
+    async fn collect_missing_payload(
+        &mut self,
+        header: &Header,
+    ) -> DagResult<HashMap<Digest, WorkerId>> {
         // We don't store the payload of our own workers.
         if header.author == self.name {
-            return Ok(false);
+            return Ok(HashMap::new());
         }
 
         let mut missing = HashMap::new();
@@ -76,15 +80,42 @@ impl Synchronizer {
             }
         }
 
+        Ok(missing)
+    }
+
+    /// Returns `true` if we have all transactions of the payload. If we don't, we return false,
+    /// synchronize with other nodes (through our workers), and re-schedule processing of the
+    /// header for when we will have its complete payload.
+    async fn missing_payload_with_mode(
+        &mut self,
+        header: &Header,
+        mode: PayloadSyncMode,
+    ) -> DagResult<bool> {
+        let missing = self.collect_missing_payload(header).await?;
+
         if missing.is_empty() {
             return Ok(false);
         }
 
         self.tx_header_waiter
-            .send(WaiterMessage::SyncBatches(missing, header.clone(), force_sync))
+            .send(WaiterMessage::SyncBatches(missing, header.clone(), mode))
             .await
             .expect("Failed to send sync batch request");
         Ok(true)
+    }
+
+    pub async fn payload_missing(&mut self, header: &Header) -> DagResult<bool> {
+        Ok(!self.collect_missing_payload(header).await?.is_empty())
+    }
+
+    pub async fn missing_payload(&mut self, header: &Header, force_sync: bool) -> DagResult<bool> {
+        self.missing_payload_with_mode(header, PayloadSyncMode::Live(force_sync))
+            .await
+    }
+
+    pub async fn missing_payload_historical(&mut self, header: &Header) -> DagResult<bool> {
+        self.missing_payload_with_mode(header, PayloadSyncMode::Historical)
+            .await
     }
 
     pub async fn fetch_header(&mut self, header_digest: Digest) -> DagResult<()> {
@@ -92,6 +123,14 @@ impl Synchronizer {
             .send(WaiterMessage::SyncHeader(header_digest))
             .await
             .expect("Failed to send sync special parent request");
+        Ok(())
+    }
+
+    pub async fn finish_committed_proposal_sync(&mut self, header_digest: Digest) -> DagResult<()> {
+        self.tx_header_waiter
+            .send(WaiterMessage::ClearCommittedProposalSync(header_digest))
+            .await
+            .expect("Failed to clear proposal suffix sync state");
         Ok(())
     }
 
@@ -249,21 +288,110 @@ impl Synchronizer {
         &mut self,
         proposal: Proposal,
         stop_height: Height,
+        slot: Slot,
     ) -> DagResult<Vec<Header>> {
-        // The list of blocks for this proposal
         let mut ancestors: Vec<Header> = Vec::new();
+        let mut counted_header_block = false;
+        let mut last_suffix_request_at: Option<time::Instant> = None;
 
-        // NOTE: Before calling, must check if proposal is ready, assumes that proposal is ready
-        // before calling
         debug!("proposal height is {:?}", proposal.height);
-        let mut header: Header = self.get_header(proposal.header_digest).await.expect("already synced should have header").unwrap();
 
-        // Otherwise we have the header and all of its ancestors
+        // Wait for the proposal header to be available (may need background sync to deliver it)
+        let mut header: Header = loop {
+            match self.get_header(proposal.header_digest.clone()).await? {
+                Some(h) => break h,
+                None => {
+                    if !counted_header_block {
+                                                counted_header_block = true;
+                    }
+                    debug!("Committer waiting for header {} at height {}", proposal.header_digest, proposal.height);
+                    let should_retry_suffix = last_suffix_request_at
+                        .map(|timestamp| {
+                            timestamp.elapsed()
+                                >= time::Duration::from_millis(COMMITTER_RECOVERY_RETRY_BACKOFF_MS)
+                        })
+                        .unwrap_or(true);
+                    if should_retry_suffix {
+                        self.tx_header_waiter
+                            .send(WaiterMessage::SyncCommittedProposal(
+                                proposal.clone(),
+                                stop_height,
+                                slot,
+                            ))
+                            .await
+                            .expect("Failed to send proposal suffix request");
+                        last_suffix_request_at = Some(time::Instant::now());
+                    }
+                    time::sleep(time::Duration::from_millis(50)).await;
+                }
+            }
+        };
+
         let mut current_height = proposal.height;
         while current_height > stop_height {
             debug!("current height is {:?}, stop height is {:?}", current_height, stop_height);
+            let mut counted_payload_block = false;
+            let mut last_payload_sync_at: Option<time::Instant> = None;
+            while self.payload_missing(&header).await? {
+                let should_retry_payload = last_payload_sync_at
+                    .map(|timestamp| {
+                        timestamp.elapsed()
+                            >= time::Duration::from_millis(COMMITTER_RECOVERY_RETRY_BACKOFF_MS)
+                    })
+                    .unwrap_or(true);
+                if should_retry_payload {
+                    self.missing_payload_historical(&header).await?;
+                    last_payload_sync_at = Some(time::Instant::now());
+                }
+                if !counted_payload_block {
+                                        counted_payload_block = true;
+                }
+                debug!(
+                    "Committer waiting for payload of header {} at height {}",
+                    header.id,
+                    header.height()
+                );
+                time::sleep(time::Duration::from_millis(50)).await;
+            }
             ancestors.push(header.clone());
-            header = self.get_parent_header(&header).await?.expect("should have parent by now");
+            let mut counted_parent_block = false;
+            // Wait for parent header (may need background sync)
+            header = loop {
+                let next_parent = if header.parent_cert.header_digest
+                    == self.genesis_headers.get(&header.author).unwrap().digest()
+                {
+                    Some(self.genesis_headers.get(&header.author).unwrap().clone())
+                } else {
+                    self.get_header(header.parent_cert.header_digest.clone()).await?
+                };
+                match next_parent {
+                    Some(h) => break h,
+                    None => {
+                        if !counted_parent_block {
+                                                        counted_parent_block = true;
+                        }
+                        debug!("Committer waiting for parent of header at height {}", current_height);
+                        let should_retry_suffix = last_suffix_request_at
+                            .map(|timestamp| {
+                                timestamp.elapsed()
+                                    >= time::Duration::from_millis(COMMITTER_RECOVERY_RETRY_BACKOFF_MS)
+                            })
+                            .unwrap_or(true);
+                        if should_retry_suffix {
+                            self.tx_header_waiter
+                                .send(WaiterMessage::SyncCommittedProposal(
+                                    proposal.clone(),
+                                    stop_height,
+                                    slot,
+                                ))
+                                .await
+                                .expect("Failed to send proposal suffix request");
+                            last_suffix_request_at = Some(time::Instant::now());
+                        }
+                        time::sleep(time::Duration::from_millis(50)).await;
+                    }
+                }
+            };
             current_height = header.height();
         }
 

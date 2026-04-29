@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use log::{info, warn};
+use crate::metrics::NETWORK_MESSAGES_TOTAL;
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
@@ -58,6 +59,7 @@ impl ReliableSender {
 
     /// Reliably send a message to a specific address.
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) -> CancelHandler {
+        NETWORK_MESSAGES_TOTAL.with_label_values(&["send"]).inc();
         let (sender, receiver) = oneshot::channel();
         self.connections
             .entry(address)
@@ -156,6 +158,7 @@ impl Connection {
                 }
                 Err(e) => {
                     warn!("{}", NetworkError::FailedToConnect(self.address, retry, e));
+                    NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_send"]).inc();
                     let timer = sleep(Duration::from_millis(delay));
                     tokio::pin!(timer);
 
@@ -163,7 +166,15 @@ impl Connection {
                         tokio::select! {
                             // Wait an increasing delay before attempting to reconnect.
                             () = &mut timer => {
-                                delay = min(2*delay, 60_000);
+                                // Cap exponential backoff at 2s. With the original 60s cap,
+                                // a transient TCP bind race at coordinated startup (one peer's
+                                // listen() finishing a few hundred ms after another's first
+                                // connect attempt) could eat ~25-50s before the next retry,
+                                // delaying epoch-synchronized primary startup by tens of seconds.
+                                // 2s max lets us reconnect within a couple of seconds of the peer
+                                // becoming available without generating excessive attempts for a
+                                // genuinely down peer.
+                                delay = min(2*delay, 2_000);
                                 retry +=1;
                                 break 'waiter;
                             },
@@ -187,6 +198,11 @@ impl Connection {
         // which we are still waiting to receive an ACK.
         let mut pending_replies = VecDeque::new();
 
+        // Enable TCP_NODELAY to disable Nagle's algorithm for low-latency communication
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY for connection to {}: {}", self.address, e);
+        }
+
         let (mut writer, mut reader) = Framed::new(stream, LengthDelimitedCodec::new()).split();
         let error = 'connection: loop {
             // Try to send all messages of the buffer.
@@ -206,6 +222,7 @@ impl Connection {
                     Err(e) => {
                         // We failed to send the message, we put it back into the buffer.
                         self.buffer.push_front((data, handler));
+                        NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_send"]).inc();
                         break 'connection NetworkError::FailedToSendMessage(self.address, e);
                     }
                 }
@@ -231,6 +248,7 @@ impl Connection {
                             // Something has gone wrong (either the channel dropped or we failed to read from it).
                             // Put the message back in the buffer, we will try to send it again.
                             pending_replies.push_front((data, handler));
+                            NETWORK_MESSAGES_TOTAL.with_label_values(&["failed_send"]).inc();
                             break 'connection NetworkError::FailedToReceiveAck(self.address);
                         }
                     }
@@ -246,3 +264,5 @@ impl Connection {
         error
     }
 }
+
+// shared counters are in network::metrics

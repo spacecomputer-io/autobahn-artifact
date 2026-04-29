@@ -141,7 +141,7 @@ impl Worker {
 
     /// Spawn all tasks responsible to handle clients transactions.
     fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {  //tx_primary: channel between processor and PrimaryConnector
-        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
+        let (tx_batch_maker, rx_batch_maker) = channel(20_000);      //channel between TxReceive (Client) and batch maker
         //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
 
@@ -263,7 +263,6 @@ impl MessageHandler for TxReceiverHandler {
             .send(message.to_vec())
             .await
             .expect("Failed to send transaction");
-
         // Give the change to schedule other tasks.
         tokio::task::yield_now().await;
         Ok(())
@@ -289,11 +288,14 @@ impl MessageHandler for WorkerReceiverHandler {
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self     //If receive batch message from another worker. Store the batch, and process.
-                .tx_processor
-                .send(serialized.to_vec())
-                .await
-                .expect("Failed to send batch"),
+            Ok(WorkerMessage::Batch(batch)) => {
+                let tx_count = batch.len() as u64;
+                self     //If receive batch message from another worker. Store the batch, and process.
+                    .tx_processor
+                    .send((serialized.to_vec(), None, tx_count))
+                    .await
+                    .expect("Failed to send batch")
+            },
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self  //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
                 .tx_helper
                 .send((missing, requestor))
@@ -322,11 +324,18 @@ impl MessageHandler for PrimaryReceiverHandler {
         // Deserialize the message and send it to the synchronizer.
         match bincode::deserialize(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(message) => self             
-                .tx_synchronizer
-                .send(message)
-                .await
-                .expect("Failed to send transaction"),
+            Ok(message) => match self.tx_synchronizer.try_send(message) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
+                    self.tx_synchronizer
+                        .send(message)
+                        .await
+                        .expect("Failed to send transaction");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("Failed to send transaction");
+                }
+            },
         }
         Ok(())
     }

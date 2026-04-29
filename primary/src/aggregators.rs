@@ -3,6 +3,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult, ConsensusError};
 use crate::messages::{Certificate, Header, Vote, QC, Timeout, TC};
+use crate::metrics::CONSENSUS_FAST_PATH_GAP_MS;
 use config::{Committee, Stake};
 use crypto::{PublicKey, Signature, Digest};
 use std::collections::HashSet;
@@ -16,6 +17,7 @@ pub struct VotesAggregator {
 
     pub complete: bool,  //Indicate that QC is ready. Stops adding new signatures
     get_once: bool,  //Indicate that QC was already used. E.g. do not re-submit QC if Timer triggers after we succeeded already
+    created_at: Option<std::time::Instant>, // Track when first vote arrives for header-to-cert latency
 }
 
 impl VotesAggregator {
@@ -26,7 +28,8 @@ impl VotesAggregator {
             used: HashSet::new(),
             diss_cert: None,
             complete: false,
-            get_once: true, 
+            get_once: true,
+            created_at: None,
         }
     }
 
@@ -43,7 +46,12 @@ impl VotesAggregator {
         // Ensure it is the first time this authority votes.
         //println!("author is {:?}", author);
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
-       
+
+        // Track when first vote arrives for header-to-cert latency
+        if self.created_at.is_none() {
+            self.created_at = Some(std::time::Instant::now());
+        }
+
         self.votes.push((author, vote.signature));
         self.dissemination_weight += committee.stake(&author);
 
@@ -87,9 +95,12 @@ pub struct QCMaker {
     used: HashSet<PublicKey>,
 
     pub try_fast: bool,  //TODO: Configure it for Fast path (if it's a Quorummaker for Prepare)
-    qc_dig: Digest, 
+    qc_dig: Digest,
     first: bool,          //Indicate when SlowQC is first ready -> I.e. only start ONE timer.
     completed_fast: bool, //Indicate whether or not we succeeded on Fast Path. This stops timer that loopbacks from re-submitting QC
+    first_vote_time: Option<std::time::Instant>, // Track when first vote arrives
+    vote_arrival_times: Vec<(PublicKey, std::time::Instant)>, // Track when each vote arrives
+    gap_recorded: bool,   // Indicate the fast-path gap (T_unanimous - T_quorum) was already observed for this Prepare QC
 }
 
 impl QCMaker {
@@ -98,10 +109,57 @@ impl QCMaker {
             weight: 0,
             votes: Vec::new(),
             used: HashSet::new(),
-            try_fast: false, // explicitly set it. (NOT done via constructor) 
+            try_fast: false, // explicitly set it. (NOT done via constructor)
             qc_dig: Digest::default(),
-            first: true, 
+            first: true,
             completed_fast: false,
+            first_vote_time: None,
+            vote_arrival_times: Vec::new(),
+            gap_recorded: false,
+        }
+    }
+
+    /// If this is a Prepare QC and unanimity has been reached, record
+    /// Δ = T_unanimous − T_quorum into the fast-path-gap histogram exactly once.
+    /// Walks `vote_arrival_times` in arrival-time order, summing each voter's
+    /// stake until it crosses `quorum_threshold` (= T_quorum) and again until
+    /// it crosses `fast_threshold` (= T_unanimous). The difference is the gap
+    /// the leader's CarTimer is racing against.
+    fn try_record_fast_path_gap(&mut self, committee: &Committee) {
+        if self.gap_recorded {
+            return;
+        }
+        // Recompute total observed stake from vote_arrival_times: self.weight is
+        // reset to 0 on QC formation, so it isn't a reliable running total here.
+        let total_observed: Stake = self
+            .vote_arrival_times
+            .iter()
+            .map(|(a, _)| committee.stake(a))
+            .sum();
+        if total_observed < committee.fast_threshold() {
+            return;
+        }
+
+        // Sort arrival timestamps ascending and walk them, accumulating stake.
+        let mut sorted: Vec<&(PublicKey, std::time::Instant)> =
+            self.vote_arrival_times.iter().collect();
+        sorted.sort_by_key(|(_, t)| *t);
+
+        let mut cumulative: Stake = 0;
+        let mut t_quorum: Option<std::time::Instant> = None;
+        for (author, time) in sorted {
+            cumulative += committee.stake(author);
+            if t_quorum.is_none() && cumulative >= committee.quorum_threshold() {
+                t_quorum = Some(*time);
+            }
+            if cumulative >= committee.fast_threshold() {
+                if let Some(t_q) = t_quorum {
+                    let gap_ms = time.duration_since(t_q).as_secs_f64() * 1000.0;
+                    CONSENSUS_FAST_PATH_GAP_MS.observe(gap_ms);
+                    self.gap_recorded = true;
+                }
+                return;
+            }
         }
     }
 
@@ -115,15 +173,48 @@ impl QCMaker {
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
         //println!("after ensure");
 
+        let now = std::time::Instant::now();
+        
+        // Track when first vote arrives
+        if self.first_vote_time.is_none() {
+            self.first_vote_time = Some(now);
+        }
+        
+        // Track each vote's arrival time
+        self.vote_arrival_times.push((author, now));
+
         self.votes.push((author, vote.1));
         self.weight += committee.stake(&author);
         //println!("QC weight is {:?}", self.weight);
+
+        // For Prepare QCs (try_fast == true) record Δ = T_unanimous − T_quorum
+        // once the 3f+1-th vote has arrived. Independent of whether the fast
+        // path itself fired in time — this is F(Δ) for the report.
+        if self.try_fast {
+            self.try_record_fast_path_gap(committee);
+        }
 
         if self.try_fast {
             return self.check_fast_qc(vote.0, committee);
         }
         //else Slow path:
         if self.weight >= committee.quorum_threshold() {
+            // Log QC formation time if it took more than 100ms
+            if let Some(start) = self.first_vote_time {
+                let elapsed = start.elapsed();
+                if elapsed.as_millis() > 100 {
+                    log::warn!("QCMaker: Slow QC formation took {}ms ({} votes)", 
+                              elapsed.as_millis(), self.votes.len());
+                    
+                    // Log detailed vote arrival pattern
+                    log::warn!("QCMaker: Vote arrival times:");
+                    for (i, (voter, arrival_time)) in self.vote_arrival_times.iter().enumerate() {
+                        let delay = arrival_time.duration_since(start).as_millis();
+                        log::warn!("  Vote {} from {:?} arrived at +{}ms", i+1, voter, delay);
+                    }
+                }
+            }
+            
             // Ensure QC is only made once.
             self.weight = 0; 
             return Ok((true, Some(QC { id: vote.0, votes: self.votes.clone() })))
@@ -134,6 +225,22 @@ impl QCMaker {
 
     pub fn check_fast_qc(&mut self, vote_dig: Digest, committee: &Committee) -> DagResult<(bool, Option<QC>)> {
         if self.weight >= committee.fast_threshold() {
+            // Log fast QC formation time if it took more than 50ms
+            if let Some(start) = self.first_vote_time {
+                let elapsed = start.elapsed();
+                if elapsed.as_millis() > 50 {
+                    log::warn!("QCMaker: Slow FAST QC formation took {}ms ({} votes)", 
+                              elapsed.as_millis(), self.votes.len());
+                    
+                    // Log detailed vote arrival pattern
+                    log::warn!("QCMaker: Fast path vote arrival times:");
+                    for (i, (voter, arrival_time)) in self.vote_arrival_times.iter().enumerate() {
+                        let delay = arrival_time.duration_since(start).as_millis();
+                        log::warn!("  Vote {} from {:?} arrived at +{}ms", i+1, voter, delay);
+                    }
+                }
+            }
+            
             // Ensure QC is only made once.
             self.weight = 0; 
             self.completed_fast = true;

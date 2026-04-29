@@ -2,6 +2,11 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 use crate::messages::ConsensusMessage;
+use crate::metrics::{
+    CONSENSUS_OLDEST_BLOCKED_SLOT, CONSENSUS_SLOTS_EXECUTED_TOTAL,
+    SLOT_COMMIT_TIMESTAMPS, now_ms, observe_batches_committed,
+    observe_batches_executed, observe_slot_executed, gc_batch_timestamps,
+};
 use crate::primary::{Slot, CHANNEL_CAPACITY};
 use crate::synchronizer::Synchronizer;
 use crate::{Certificate, Header, Height};
@@ -9,13 +14,12 @@ use crate::{Certificate, Header, Height};
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::borrow::BorrowMut;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
 
@@ -72,6 +76,7 @@ impl State {
 
 pub struct Committer {
     gc_depth: Height,
+    committee_size: usize,
     rx_mempool: Receiver<Certificate>,
     rx_deliver: Receiver<Certificate>,
     rx_commit_message: Receiver<ConsensusMessage>,
@@ -91,6 +96,7 @@ impl Committer {
         tx_output: Sender<Header>,
         synchronizer: Synchronizer,
     ) {
+        let committee_size = committee.size();
         let (tx_deliver, rx_deliver) = channel(CHANNEL_CAPACITY);
 
         let genesis = Certificate::genesis(&committee);
@@ -102,6 +108,7 @@ impl Committer {
         tokio::spawn(async move {
             Self {
                 gc_depth,
+                committee_size,
                 rx_mempool,
                 rx_deliver,
                 rx_commit_message,
@@ -116,7 +123,7 @@ impl Committer {
 
     async fn process_commit_message(&mut self, state: &mut State, commit_message: ConsensusMessage) {
         match commit_message.clone() {
-            ConsensusMessage::Commit{slot, view: _, qc: _, proposals: _} => {
+            ConsensusMessage::Commit{slot, view: _, qc, proposals: _} => {
                 if slot <= state.last_executed_slot {
                     debug!("Already committed slot {}", slot);
                     return;
@@ -124,23 +131,49 @@ impl Committer {
 
                 // Store the commit message if all proposals are ready to be processed
                 state.log.insert(slot, commit_message);
+                let pending_slots = state.log.len();
+
+                // Warn if too many slots are pending
+                if pending_slots > 100 {
+                    warn!("COMMITTER: {} slots pending execution! Last executed: {}, oldest pending: {:?}", 
+                          pending_slots, state.last_executed_slot, 
+                          state.log.keys().min());
+                }
 
                 while state.log.contains_key(&(state.last_executed_slot + 1)) {
+                    let slot_start_time = std::time::Instant::now();
                     let current_commit_message = state.log.get(&(state.last_executed_slot + 1)).unwrap();
-                    debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
-                    match current_commit_message {
-                        ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
-                            for (pk, proposal) in proposals {
-                                let stop_height = *state.last_executed_heights.get(pk).unwrap();
-                                // Don't execute proposals which are too old
-                                if proposal.height <= stop_height {
+                        debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
+                        match current_commit_message {
+                            ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
+                                let mut total_headers_committed = 0;
+                                let executing_slot = state.last_executed_slot + 1;
+                                let mut all_batch_digests: Vec<crypto::Digest> = Vec::new();
+
+                                for (pk, proposal) in proposals {
+                                    let stop_height = *state.last_executed_heights.get(pk).unwrap();
+                                    // Don't execute proposals which are too old
+                                    if proposal.height <= stop_height {
                                     debug!("skipping this proposal because it's too old");
                                     continue;
-                                }
+                                    }
 
-                                let headers = self.synchronizer.get_all_headers_for_proposal(proposal.clone(), stop_height)
-                                    .await
-                                    .expect("should have ancestors by now");
+                                    let get_headers_start = std::time::Instant::now();
+                                    let headers = self
+                                        .synchronizer
+                                        .get_all_headers_for_proposal(
+                                            proposal.clone(),
+                                            stop_height,
+                                            executing_slot,
+                                        )
+                                        .await
+                                        .expect("should have ancestors by now");
+                                    let sync_elapsed = get_headers_start.elapsed();
+
+                                if sync_elapsed.as_millis() > 10 {
+                                    warn!("COMMITTER: Synchronizer took {}ms to get {} headers for proposal at height {}",
+                                          sync_elapsed.as_millis(), headers.len(), proposal.height);
+                                }
 
                                 // Update last executed height for the lane
                                 if proposal.height > stop_height {
@@ -149,6 +182,10 @@ impl Committer {
 
                                 // Commit all of the headers
                                 for header in headers {
+                                    total_headers_committed += 1;
+                                    // Collect batch digests for latency observation.
+                                    all_batch_digests.extend(header.payload.keys().cloned());
+
                                     info!("Committed {}", header);
                                     #[cfg(feature = "benchmark")]
                                     for digest in header.payload.keys() {
@@ -160,13 +197,47 @@ impl Committer {
                                     if let Err(e) = self.tx_output.send(header.clone()).await {
                                         debug!("Failed to send block through the output channel: {}", e);
                                     }
+
                                     debug!("Finish upcall");
                                 }
+                                }
+
+                            let slot_elapsed = slot_start_time.elapsed();
+
+                            if slot_elapsed.as_millis() > 50 {
+                                warn!("COMMITTER: Slot {} took {}ms to commit {} headers ({} proposals)",
+                                      state.last_executed_slot + 1, slot_elapsed.as_millis(),
+                                      total_headers_committed, proposals.len());
                             }
+
                             state.last_executed_slot += 1;
+                            CONSENSUS_SLOTS_EXECUTED_TOTAL.inc();
+
+                            // Observe latency metrics for this executed slot.
+                            let execute_ts = now_ms();
+                            // tx-to-commit: use the commit timestamp recorded by core.rs
+                            if let Some(commit_ts) = SLOT_COMMIT_TIMESTAMPS.lock().unwrap().get(&executing_slot).copied() {
+                                observe_batches_committed(&all_batch_digests, commit_ts);
+                            }
+                            // tx-to-execute and commit-to-execute
+                            observe_batches_executed(&all_batch_digests, execute_ts);
+                            observe_slot_executed(executing_slot, execute_ts);
+                            // Periodically GC old batch timestamps (retain last 5 minutes).
+                            gc_batch_timestamps(300_000);
+
+                            // Remove the executed slot from the pending queue
+                            state.log.remove(&state.last_executed_slot);
                         },
                         _ => {}
                     }
+                }
+
+                // Update oldest-blocked-slot gauge: if slots remain in the log,
+                // they are committed but cannot execute yet (predecessor missing).
+                if let Some(&oldest) = state.log.keys().min() {
+                    CONSENSUS_OLDEST_BLOCKED_SLOT.set(oldest as i64);
+                } else {
+                    CONSENSUS_OLDEST_BLOCKED_SLOT.set(0);
                 }
 
             },
@@ -177,6 +248,11 @@ impl Committer {
     async fn run(&mut self) {
         // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
+        
+        // Stats tracking
+        let mut commits_received: u64 = 0;
+        let mut last_stats_log = std::time::Instant::now();
+        let mut last_executed_slot = 0u64;
 
         loop {
             tokio::select! {
@@ -188,10 +264,32 @@ impl Committer {
                     );*/
                 },
                 Some(commit_message) = self.rx_commit_message.recv() => {
+                    commits_received += 1;
                     self.process_commit_message(state.borrow_mut(), commit_message).await;
                 },
                 Some(_) = self.rx_deliver.recv() => {}
 
+            }
+            
+            // Log aggregate stats every 5 seconds
+            if last_stats_log.elapsed().as_secs() >= 5 {
+                let elapsed = last_stats_log.elapsed().as_secs_f64();
+                let commit_msgs_rate = commits_received as f64 / elapsed;
+                let slots_committed = state.last_executed_slot.saturating_sub(last_executed_slot);
+                let slot_rate = slots_committed as f64 / elapsed;
+                let pending_slots = state.log.len();
+
+                info!("COMMITTER: Received {} commit msgs ({:.1}/s), executed {} slots ({:.1} slot/s), {} pending in last {:.1}s", 
+                      commits_received, commit_msgs_rate, slots_committed, slot_rate, pending_slots, elapsed);
+                
+                if pending_slots > 50 {
+                    warn!("COMMITTER: High backlog - {} pending slots! Oldest: {:?}, Last executed: {}", 
+                          pending_slots, state.log.keys().min(), state.last_executed_slot);
+                }
+                
+                commits_received = 0;
+                last_executed_slot = state.last_executed_slot;
+                last_stats_log = std::time::Instant::now();
             }
         }
     }

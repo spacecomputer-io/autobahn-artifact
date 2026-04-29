@@ -19,7 +19,7 @@ use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use futures::sink::SinkExt as _;
-use log::info;
+use log::{info, debug, warn, error};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -39,6 +39,13 @@ pub type View = u64;
 // The slot (sequence) number of consensus
 pub type Slot = u64;
 
+/// Maximum number of headers returned in a single `HeaderRange` response.
+/// Enforced on both client (requester sets a matching from_height window)
+/// and server (response truncated to this count regardless of from_height)
+/// to bound per-request work and prevent a malicious requester from walking
+/// back to genesis in one shot.
+pub const LIVE_SYNC_RANGE_WINDOW: Height = 32;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
     Header(Header, bool),
@@ -52,6 +59,9 @@ pub enum PrimaryMessage {
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
     HeadersRequest(Vec<Digest>, /* requestor */ PublicKey),
     ProposalHeadersRequest(Proposal, Height, /* requestor */ PublicKey),
+    ProposalHeaders(Vec<Header>),
+    HeaderRangeRequest(/* start_digest */ Digest, /* from_height */ Height, /* requestor */ PublicKey),
+    HeaderRange(Vec<Header>),
 }
 
 /// The messages sent by the primary to its workers.
@@ -59,6 +69,8 @@ pub enum PrimaryMessage {
 pub enum PrimaryWorkerMessage {
     /// The primary indicates that the worker need to sync the target missing batches.
     Synchronize(Vec<Digest>, /* target */ PublicKey),
+    /// Commit-critical batch sync for the earliest blocked slot.
+    SynchronizeCommitted(Vec<Digest>, /* target */ PublicKey, /* blocked_height */ Height),
     /// The primary indicates a round update.
     Cleanup(Height),
 }
@@ -67,9 +79,9 @@ pub enum PrimaryWorkerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
-    OurBatch(Digest, WorkerId),
+    OurBatch(Digest, WorkerId, /* first_tx_submit_ms */ u64, /* batch_size_bytes */ u64, /* tx_count */ u64),
     /// The worker indicates it received a batch's digest from another authority.
-    OthersBatch(Digest, WorkerId),
+    OthersBatch(Digest, WorkerId, /* batch_size_bytes */ u64, /* tx_count */ u64),
 }
 
 pub struct Primary;
@@ -101,11 +113,12 @@ impl Primary {
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_header_requests, rx_header_requests) = channel(CHANNEL_CAPACITY);
+        let (tx_proposal_header_requests, rx_proposal_header_requests) = channel(CHANNEL_CAPACITY);
+        let (tx_header_range_requests, rx_header_range_requests) = channel(CHANNEL_CAPACITY);
         let (tx_instance, rx_instance) = channel(CHANNEL_CAPACITY);
         let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(CHANNEL_CAPACITY);
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
         let (_tx_mempool, rx_mempool) = channel(CHANNEL_CAPACITY);
-
 
         // Write the parameters to the logs.
         // NOTE: These log entries are needed to compute performance.
@@ -128,6 +141,8 @@ impl Primary {
                 tx_primary_messages,
                 tx_cert_requests,
                 tx_header_requests,
+                tx_proposal_header_requests,
+                tx_header_range_requests,
             },
         );
         info!(
@@ -262,7 +277,14 @@ impl Primary {
         );
 
         // The `Helper` is dedicated to reply to certificates requests from other primaries.
-        Helper::spawn(committee.clone(), store, rx_cert_requests, rx_header_requests);
+        Helper::spawn(
+            committee.clone(),
+            store,
+            rx_cert_requests,
+            rx_header_requests,
+            rx_proposal_header_requests,
+            rx_header_range_requests,
+        );
 
         // NOTE: This log entry is used to compute performance.
         info!(
@@ -283,6 +305,8 @@ struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
     tx_header_requests: Sender<(Vec<Digest>, PublicKey)>,
+    tx_proposal_header_requests: Sender<(Proposal, Height, PublicKey)>,
+    tx_header_range_requests: Sender<(Digest, Height, PublicKey)>,
 }
 
 #[async_trait]
@@ -301,6 +325,16 @@ impl MessageHandler for PrimaryReceiverHandler {
             PrimaryMessage::HeadersRequest(missing, requestor) => self
                 .tx_header_requests
                 .send((missing, requestor))
+                .await
+                .expect("Failed to send primary message"),
+            PrimaryMessage::ProposalHeadersRequest(proposal, stop_height, requestor) => self
+                .tx_proposal_header_requests
+                .send((proposal, stop_height, requestor))
+                .await
+                .expect("Failed to send primary message"),
+            PrimaryMessage::HeaderRangeRequest(start_digest, from_height, requestor) => self
+                .tx_header_range_requests
+                .send((start_digest, from_height, requestor))
                 .await
                 .expect("Failed to send primary message"),
             request => {
@@ -331,17 +365,56 @@ impl MessageHandler for WorkerReceiverHandler {
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
-        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
-                .tx_our_digests                                         //sender channel to Proposer
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
-                .tx_others_digests                                      //sender channel to PayloadReceiver
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests"),
+        match bincode::deserialize(&serialized) {
+            Ok(message) => match message {
+                WorkerPrimaryMessage::OurBatch(digest, worker_id, first_tx_submit_ms, batch_size_bytes, tx_count) => {
+                    // Record batch creation timestamp for latency tracking.
+                    if first_tx_submit_ms > 0 {
+                        crate::metrics::record_batch_created(&digest, first_tx_submit_ms);
+                    }
+                    crate::metrics::record_batch_tx_count(&digest, tx_count);
+                    // Use try_send to detect channel backpressure
+                    let digest_copy = digest.clone();
+                    match self.tx_our_digests.try_send((digest, worker_id)) {
+                        Ok(_) => {},
+                        Err(tokio::sync::mpsc::error::TrySendError::Full((d, wid))) => {
+                            warn!("PRIMARY: tx_our_digests channel FULL! Worker {} batch {} blocked - Proposer may be overloaded", 
+                                  wid, d);
+                            // Fallback to blocking send
+                            if let Err(e) = self.tx_our_digests.send((d, wid)).await {
+                                error!("PRIMARY: CRITICAL - Failed to send OurBatch {} from worker {}: {}", digest_copy, wid, e);
+                            }
+                        },
+                        Err(e) => {
+                            error!("PRIMARY: CRITICAL - Channel closed for OurBatch {} from worker {}: {}", digest_copy, worker_id, e);
+                        }
+                    }
+                },
+                WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch_size_bytes, tx_count) => {
+                    crate::metrics::record_batch_tx_count(&digest, tx_count);
+                    // Use try_send to detect channel backpressure
+                    let digest_copy = digest.clone();
+                    match self.tx_others_digests.try_send((digest, worker_id)) {
+                        Ok(_) => {},
+                        Err(tokio::sync::mpsc::error::TrySendError::Full((d, wid))) => {
+                            warn!("PRIMARY: tx_others_digests channel FULL! Worker {} batch {} blocked - PayloadReceiver may be overloaded", 
+                                  wid, d);
+                            // Fallback to blocking send
+                            if let Err(e) = self.tx_others_digests.send((d, wid)).await {
+                                error!("PRIMARY: CRITICAL - Failed to send OthersBatch {} from worker {}: {}", digest_copy, wid, e);
+                            }
+                        },
+                        Err(e) => {
+                            error!("PRIMARY: CRITICAL - Channel closed for OthersBatch {} from worker {}: {}", digest_copy, worker_id, e);
+                        }
+                    }
+                },
+            },
+            Err(e) => {
+                error!("PRIMARY: CRITICAL - Failed to deserialize WorkerPrimaryMessage from {} bytes: {:?}", 
+                       serialized.len(), e);
+                return Err(Box::new(DagError::SerializationError(e)));
+            }
         }
         Ok(())
     }
