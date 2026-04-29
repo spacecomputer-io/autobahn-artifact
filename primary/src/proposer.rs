@@ -158,8 +158,6 @@ impl Proposer {
         self.num_active_instances = 0;
       
         // Send the new header to the `Core` that will broadcast and process it.
-        // Propose time tracking removed - now using slot-level latency
-
         match self.tx_core.try_send(header) {
             Ok(_) => {},
             Err(tokio::sync::mpsc::error::TrySendError::Full(h)) => {

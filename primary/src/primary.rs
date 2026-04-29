@@ -23,7 +23,6 @@ use log::{info, debug, warn, error};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::process::Command;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,23 +38,6 @@ pub type Height = u64;
 pub type View = u64;
 // The slot (sequence) number of consensus
 pub type Slot = u64;
-
-fn current_git_revision() -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let revision = String::from_utf8(output.stdout).ok()?;
-    let revision = revision.trim();
-    if revision.is_empty() {
-        None
-    } else {
-        Some(revision.to_string())
-    }
-}
 
 /// Maximum number of headers returned in a single `HeaderRange` response.
 /// Enforced on both client (requester sets a matching from_height window)
@@ -137,14 +119,6 @@ impl Primary {
         let (tx_header_waiter_instances, rx_header_waiter_instances) = channel(CHANNEL_CAPACITY);
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
         let (_tx_mempool, rx_mempool) = channel(CHANNEL_CAPACITY);
-
-        // VERSION IDENTIFIER - Log version to verify which code is running
-        match current_git_revision() {
-            Some(revision) => {
-                info!("PRIMARY VERSION: prometheus-metrics-csv-export-v2 commit={}", revision)
-            }
-            None => info!("PRIMARY VERSION: prometheus-metrics-csv-export-v2 commit=unknown"),
-        }
 
         // Write the parameters to the logs.
         // NOTE: These log entries are needed to compute performance.

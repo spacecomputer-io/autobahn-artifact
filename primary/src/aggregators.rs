@@ -129,9 +129,8 @@ impl QCMaker {
         if self.gap_recorded {
             return;
         }
-        // Total observed stake from every vote we have seen so far. Computed
-        // from vote_arrival_times because self.weight gets reset to 0 on QC
-        // formation and is no longer a reliable cumulative.
+        // Recompute total observed stake from vote_arrival_times: self.weight is
+        // reset to 0 on QC formation, so it isn't a reliable running total here.
         let total_observed: Stake = self
             .vote_arrival_times
             .iter()

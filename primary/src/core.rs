@@ -1820,10 +1820,9 @@ impl Core {
         // GC QC makers (consensus vote aggregation state)
         self.qc_makers.retain(|(s, _), _| *s > slot || s % k != slot_period);
 
-        // GC TC makers (timeout certificate aggregation state).
-        // NOTE: Previously tc_makers was never cleaned up at all, causing unbounded growth
-        // as every new (slot, view) pair on timeout created a permanent entry. This was the
-        // primary driver of event-loop starvation under high latency.
+        // GC TC makers (timeout certificate aggregation state). Without this retain,
+        // every (slot, view) pair created on timeout becomes a permanent entry and
+        // starves the event loop under high latency.
         self.tc_makers.retain(|(s, _), _| *s > slot || s % k != slot_period);
 
         // GC per-slot proposal and QC state

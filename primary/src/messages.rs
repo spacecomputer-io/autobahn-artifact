@@ -882,12 +882,9 @@ impl Certificate {
             .collect()
     }
 
-    /// Verify this certificate has f+1 stake (proof of availability).
-    /// Dissemination certs are formed at validity_threshold (f+1), so this is
-    /// the correct check for PoA verification in non-blocking consensus voting.
     /// Verify this certificate has f+1 stake (proof of availability) with valid signatures.
-    /// Dissemination certs are formed at validity_threshold (f+1), so this is
-    /// the correct check for PoA verification in non-blocking consensus voting.
+    /// Dissemination certs are formed at validity_threshold (f+1), which is the correct
+    /// check for PoA verification in non-blocking consensus voting.
     pub fn verify_availability(&self, committee: &Committee) -> DagResult<()> {
         if Self::genesis(committee).contains(self) {
             return Ok(());

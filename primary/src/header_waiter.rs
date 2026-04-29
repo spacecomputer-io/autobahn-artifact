@@ -126,12 +126,12 @@ pub struct HeaderWaiter {
     /// when the missing batches arrive. These are historical/commit-recovery headers
     /// that are already in the store and only need their payload to become available.
     historical_payload_waiters: HashSet<Digest>,
-    /// [E1] Tracks proposal header digests that are already being fetched,
-    /// to avoid sending redundant sync requests when multiple consensus messages
-    /// (e.g., Prepare for the same slot across different views) reference the same proposal.
+    /// Tracks proposal header digests that are already being fetched, to avoid
+    /// sending redundant sync requests when multiple consensus messages (e.g.,
+    /// Prepare for the same slot across different views) reference the same proposal.
     inflight_proposals: HashSet<Digest>,
-    /// [F] Pending proposal sync requests ordered by slot, so lower slots get
-    /// processed first. This is a simple Vec that we sort before draining.
+    /// Pending proposal sync requests ordered by slot, so lower slots get
+    /// processed first. Sorted before draining.
     pending_proposal_syncs: Vec<PendingProposalSync>,
     /// Newly arrived commit-time suffix sync requests ordered by slot.
     pending_commit_syncs: Vec<PendingCommitSync>,
@@ -139,7 +139,7 @@ pub struct HeaderWaiter {
     proposal_sync_requests: HashMap<Digest, PendingSuffixSync>,
 }
 
-/// [F] Tracks a deferred proposal sync request with its consensus slot for priority ordering.
+/// Tracks a deferred proposal sync request with its consensus slot for priority ordering.
 struct PendingProposalSync {
     slot: Slot,
     missing: Vec<Proposal>,
@@ -267,9 +267,9 @@ impl HeaderWaiter {
         }
     }
 
-    /// [F] Process pending proposal syncs in slot-priority order (lowest slot first).
-    /// This ensures that sync bandwidth is focused on unblocking the oldest stalled
-    /// consensus slots, which is critical during partition recovery.
+    /// Process pending proposal syncs in slot-priority order (lowest slot first).
+    /// Focuses sync bandwidth on unblocking the oldest stalled consensus slots,
+    /// which is critical during partition recovery.
     async fn drain_pending_proposal_syncs(&mut self) {
         if self.pending_proposal_syncs.is_empty() {
             return;
@@ -396,14 +396,14 @@ impl HeaderWaiter {
             }
         });
 
-        // [E1] Send sync requests only for proposals not already in-flight.
+        // Send sync requests only for proposals not already in-flight.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Failed to measure time")
             .as_millis();
         let mut requires_sync = Vec::new();
         for proposal in &missing {
-            // [E1] Skip if we're already fetching this proposal header
+            // Skip if we're already fetching this proposal header.
             if self.inflight_proposals.contains(&proposal.header_digest) {
                 if let Some(request) = self.parent_requests.get_mut(&proposal.header_digest) {
                     request.round = request.round.max(proposal.height);
@@ -435,10 +435,9 @@ impl HeaderWaiter {
             }
         }
         if !requires_sync.is_empty() {
-            // [E2] Fan out to multiple nodes instead of just the author.
-            // During partition recovery, the author might be a returning node that's
-            // still syncing itself. Targeting multiple nodes increases the chance of
-            // a fast response.
+            // Fan out to multiple nodes instead of just the author. During partition
+            // recovery, the author might be a returning node that's still syncing
+            // itself, so targeting multiple nodes increases the chance of a fast response.
             let addresses: Vec<_> = self.committee
                 .others_primaries(&self.name)
                 .iter()
@@ -513,9 +512,9 @@ impl HeaderWaiter {
                                         .batch_requests
                                         .entry(digest.clone())
                                         .or_insert((round, false));
-                                    // Always re-send when Historical mode upgrades a
-                                    // previously live-only request so the worker receives
-                                    // SynchronizeCommitted and can promote to CommitCritical.
+                                    // Always re-send in Historical mode so the worker
+                                    // receives SynchronizeCommitted and can promote to
+                                    // CommitCritical even if a Live request was already sent.
                                     let needs_send = match mode {
                                         PayloadSyncMode::Historical => true,
                                         PayloadSyncMode::Live(_) => !entry.1,
@@ -597,7 +596,7 @@ impl HeaderWaiter {
 
                                 let message = PrimaryMessage::HeadersRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                // [E2] Use wider fan-out for initial header sync
+                                // Wider fan-out for initial header sync.
                                 self.network.lucky_broadcast(addresses, Bytes::from(bytes), INITIAL_SYNC_FANOUT).await;
                                 DISSEMINATION_SYNC_REQUESTS_TOTAL.with_label_values(&["header"]).inc();
                             }
@@ -714,7 +713,7 @@ impl HeaderWaiter {
                                 continue;
                             }
 
-                            // [F] Queue this sync request for priority-ordered processing
+                            // Queue this sync request for priority-ordered processing.
                             self.pending_proposal_syncs.push(PendingProposalSync {
                                 slot,
                                 missing,
@@ -761,14 +760,11 @@ impl HeaderWaiter {
                     }
                 },
 
-                // Note: Proposal sync waiters are now handled by spawned tasks
-                // that send directly to tx_consensus_loopback when complete.
-
                 () = &mut timer => {
                     self.dispatch_pending_commit_syncs().await;
 
-                    // [F] First, process any queued proposal syncs in slot-priority order.
-                    // Sort by slot ascending so lowest (most critical) slots sync first.
+                    // Drain queued proposal syncs in slot-priority order so the lowest
+                    // (most critical) slots sync first.
                     self.drain_pending_proposal_syncs().await;
 
                     // We optimistically sent sync requests to a single node. If this timer triggers,

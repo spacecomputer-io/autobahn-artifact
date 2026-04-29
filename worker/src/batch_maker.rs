@@ -234,8 +234,6 @@ impl BatchMaker {
                     u64::from_be_bytes(id)
                 );
             }
-
-        // NOTE: Removed individual batch size logging - now using aggregate stats
         }
 
         WORKER_INGRESS_BATCHES_CREATED_TOTAL.inc();
